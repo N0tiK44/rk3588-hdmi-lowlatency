@@ -1,0 +1,46 @@
+/hdmirx-kms-lowlat
+ \
+/hdmirx-kms-lowlat \
+*.o \
+*.csv \
+*.log \
+__pycache__/ \
+*.py[cod] > .gitignore
+
+
+
+
+
+
+
+printf *.on*.csv
+ \
+/hdmirx-kms-lowlat \
+*.o \
+*.csv \
+*.log \
+__pycache__/ \
+*.py[cod] > .gitignore
+
+
+
+
+
+
+
+printf *.logn__pycache__/
+ \
+/hdmirx-kms-lowlat \
+*.o \
+*.csv \
+*.log \
+__pycache__/ \
+*.py[cod] > .gitignore
+
+
+
+
+
+
+
+printf *.py[cod]n
