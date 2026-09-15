@@ -95,7 +95,7 @@ Early V3 measurement packages could emit literal `\\n` sequences into CSV output
 
 Atomic async flips are more restricted than normal atomic commits. In particular, the request must be a pure framebuffer flip; changing `OUT_FENCE_PTR`, `CRTC_ID`, or geometry makes it an unsupported state change. The consolidated test therefore:
 
-1. checks `DRM_CAP_ASYNC_PAGE_FLIP` before capture allocation,
+1. queries `DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP` (and logs the distinct legacy `DRM_CAP_ASYNC_PAGE_FLIP` value),
 2. performs one normal full-state seed commit with `OUT_FENCE_PTR`,
 3. submits subsequent frames with only `FB_ID` and `IN_FENCE_FD`,
 4. uses `DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_ASYNC | DRM_MODE_PAGE_FLIP_EVENT`, and
@@ -103,4 +103,4 @@ Atomic async flips are more restricted than normal atomic commits. In particular
 
 The DMA-BUF layout, acquire-fence handoff, four-buffer pool, zero-copy behavior and ownership boundary remain comparable. Only the completion primitive differs: normal rows measure output-fence readiness; async rows measure page-flip event delivery. The CSV's `async_commit` column distinguishes the normal seed from true async rows, and the analyzer excludes the seed from async statistics.
 
-Kernel/driver support is not assumed. Linux 6.1 rejects the async flag for atomic commits. Newer DRM core code also requires the driver to advertise and implement async flips; upstream Rockchip VOP2 commonly does not. A clear nonzero “unsupported” result is therefore expected on many RK3588 images and does not invalidate V3.4.
+Kernel/driver support is not assumed. Linux 6.1 neither exposes the atomic-async capability nor accepts the async flag for atomic commits. The V3.5 diagnostic deliberately makes one attempt after warning when the capability is absent, so a vendor backport can still be discovered and the exact rejection can be captured. Newer DRM core code also requires the driver to advertise and implement async flips; upstream Rockchip VOP2 commonly does not. A clear nonzero “unsupported” result is therefore expected on many RK3588 images and does not invalidate V3.4.

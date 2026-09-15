@@ -31,22 +31,37 @@ The active path has **no GStreamer, no CPU colour conversion, no framebuffer cop
 
 Connector/plane IDs are machine-specific. The defaults above are the proven test platform values.
 
-## Build
+## First checkout and build
 
-On the Orange Pi:
+On the Orange Pi (Armbian/Ubuntu package names):
 
 ```bash
 sudo apt update
 sudo apt install -y build-essential pkg-config libdrm-dev python3
+
+mkdir -p ~/src
+cd ~/src
+git clone https://github.com/N0tiK44/rk3588-hdmi-lowlatency.git
+cd rk3588-hdmi-lowlatency
+
 make clean
+make check
 make
 ```
 
-Optional local checks:
+Do not clone a second copy inside the repository. For every later GitHub update, use the existing checkout:
 
 ```bash
+cd ~/src/rk3588-hdmi-lowlatency
+git switch main
+git pull --ff-only
+git status --short
+make clean
 make check
+make
 ```
+
+`git status --short` should print nothing before a routine pull. If it lists files, preserve or commit those local changes before updating instead of overwriting them.
 
 ## Baseline run
 
@@ -77,7 +92,7 @@ This performs two zero-copy runs:
 
 Atomic async flips cannot change `OUT_FENCE_PTR` or repeat unrelated plane state, so the async run uses the page-flip event as its completion/lifetime signal. The CSV labels the seed row and each async row. Tearing is acceptable: V3.5 is a diagnostic test of display-phase bypass, not a presentation-quality mode.
 
-The experiment is capability-gated with `DRM_CAP_ASYNC_PAGE_FLIP`. Linux 6.1 rejects async flags on atomic commits, and a newer kernel still needs explicit async support in the DRM driver/plane. Many RK3588 Rockchip/VOP2 kernels are therefore expected to report this test as unsupported. The runner preserves both logs and the normal trace, then exits nonzero so an unsupported async result cannot be mistaken for success.
+The experiment queries `DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP`, which is distinct from the legacy `DRM_CAP_ASYNC_PAGE_FLIP` capability. Linux 6.1 does not expose the atomic capability and rejects async flags on atomic commits. Because this is a diagnostic, the program logs both capabilities and still makes one real async atomic attempt, allowing vendor backports to be detected. A newer kernel also needs explicit async support in the DRM driver/plane. Many RK3588 Rockchip/VOP2 kernels are therefore expected to reject the attempt; the runner preserves both logs and the normal trace, then exits nonzero so an unsupported result cannot be mistaken for success.
 
 Results go to `/tmp/hdmirx-v35/`.
 
@@ -117,19 +132,11 @@ The remaining dominant latency is therefore display/vblank phase and buffer owne
 
 ## Safe Git workflow for experiments
 
-After extracting this repository and verifying the baseline on the board:
+The GitHub checkout is already a Git repository; do not run `git init` again. Mark a hardware-verified baseline once, then create each risky experiment from that tag:
 
 ```bash
-git init
-git add .
-git commit -m "Consolidated RK3588 HDMI-RX baseline"
-git branch -M main
 git tag -a v3.4-known-good -m "Known-good four-buffer explicit-sync baseline"
-```
-
-Create each risky experiment on a branch from that tag:
-
-```bash
+git push origin v3.4-known-good
 git switch -c experiment/v3.5-async v3.4-known-good
 ```
 

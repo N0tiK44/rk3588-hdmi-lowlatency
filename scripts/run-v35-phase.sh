@@ -36,6 +36,18 @@ ALOG="$OUTDIR/async-b${BUFFERS}.log"
 REPORT="$OUTDIR/report.txt"
 rm -f "$SYNC" "$ASYNC" "$SLOG" "$ALOG" "$REPORT"
 
+report_environment() {
+  echo "Kernel: $(uname -r)"
+  if command -v pkg-config >/dev/null 2>&1; then
+    echo "libdrm: $(pkg-config --modversion libdrm 2>/dev/null || echo unknown)"
+  else
+    echo "libdrm: unknown (pkg-config unavailable)"
+  fi
+  echo "Video: $VIDEO"
+  echo "DRM: $CARD connector=$CONNECTOR plane=$PLANE"
+  echo "Buffers: $BUFFERS"
+}
+
 common=(
   --video "$VIDEO" --card "$CARD"
   --connector "$CONNECTOR" --plane "$PLANE"
@@ -65,17 +77,25 @@ set -e
 
 if [[ $ARC -ne 0 || ! -s "$ASYNC" ]]; then
   {
+    report_environment
+    echo
     python3 "$ROOT/tools/analyze.py" "$SYNC"
     echo
     echo "ASYNC run did not complete successfully (exit=$ARC)."
-    echo "This usually means DRM_CAP_ASYNC_PAGE_FLIP is absent or the driver rejected the atomic async flip."
+    echo "This usually means DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP is absent or the kernel/driver rejected the atomic async flip."
     echo "That is a valid V3.5 result; the normal V3.4 baseline is still preserved."
     echo "See: $ALOG"
+    echo
+    echo "--- async log tail ---"
+    tail -n 80 "$ALOG" || true
   } | tee "$REPORT"
-  tail -n 80 "$ALOG" >&2 || true
   [[ $ARC -ne 0 ]] && exit "$ARC"
   exit 1
 fi
 
-python3 "$ROOT/tools/analyze.py" "$SYNC" "$ASYNC" | tee "$REPORT"
+{
+  report_environment
+  echo
+  python3 "$ROOT/tools/analyze.py" "$SYNC" "$ASYNC"
+} | tee "$REPORT"
 echo "Report: $REPORT"

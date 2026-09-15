@@ -1,13 +1,19 @@
 # Versioning and rollback
 
-Keep `main` runnable and use annotated tags for hardware-verified states. The ZIP does not contain a hidden `.git` directory, so initialize history after extracting it:
+Keep `main` runnable and use annotated tags for hardware-verified states. A normal GitHub clone is already initialized; do not run `git init` inside it. Update a clean checkout with:
 
 ```bash
-git init
-git add .
-git commit -m "Consolidated RK3588 HDMI-RX baseline"
-git branch -M main
+cd ~/src/rk3588-hdmi-lowlatency
+git switch main
+git status --short
+git pull --ff-only
+```
+
+`git status --short` should be empty before pulling. After the four-buffer normal path has been verified on hardware, mark that exact commit once:
+
+```bash
 git tag -a v3.4-known-good -m "Known-good four-buffer explicit-sync baseline"
+git push origin v3.4-known-good
 ```
 
 The V3.5 code is included, but its normal mode is the known-good V3.4 path and `--async-flip` remains experimental. Test each hypothesis on a branch created from the verified tag:
@@ -40,8 +46,7 @@ git tag -a v3.5-async-result -m "Hardware-verified V3.5 async result"
 Push branches and tags explicitly when the remote is ready:
 
 ```bash
-git remote add origin YOUR_NEW_REPOSITORY_URL
-git push -u origin main
+git push -u origin experiment/v3.5-async
 git push origin --tags
 ```
 

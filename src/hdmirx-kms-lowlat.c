@@ -26,6 +26,12 @@
 #define DRM_MODE_PAGE_FLIP_ASYNC 0x02
 #endif
 
+/* Added after Linux 6.1; keep the diagnostic build source-compatible with
+ * older libdrm header packages while still querying the correct atomic cap. */
+#ifndef DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP
+#define DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP 0x15
+#endif
+
 #ifndef DRM_FORMAT_NV24
 #define DRM_FORMAT_NV24 fourcc_code('N','V','2','4')
 #endif
@@ -1882,33 +1888,57 @@ int main(
 
 
     if (o.async_flip) {
-        uint64_t async_cap = 0;
+        uint64_t atomic_async_cap = 0;
+        uint64_t legacy_async_cap = 0;
+        int atomic_cap_result;
+        int atomic_cap_errno;
+
+        /*
+         * DRM_CAP_ASYNC_PAGE_FLIP describes the legacy page-flip ioctl.
+         * Atomic async commits have a separate capability.  Linux 6.1 does
+         * not implement that newer capability and rejects the async flag in
+         * the atomic ioctl.  Because this program is an explicit diagnostic,
+         * continue to one real atomic attempt after a clear warning: this
+         * also detects vendor backports that accept the flag without
+         * advertising the newer capability.
+         */
+        atomic_cap_result = drmGetCap(
+            drmfd,
+            DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP,
+            &atomic_async_cap
+        );
+        atomic_cap_errno = errno;
 
         if (drmGetCap(
             drmfd,
             DRM_CAP_ASYNC_PAGE_FLIP,
-            &async_cap) < 0) {
+            &legacy_async_cap) < 0) {
 
-            perror("DRM_CAP_ASYNC_PAGE_FLIP");
-            goto out;
+            legacy_async_cap = 0;
         }
 
-        if (!async_cap) {
+        if (atomic_cap_result == 0 && atomic_async_cap) {
             fprintf(
                 stderr,
-                "DRM reports no asynchronous page-flip support.\n"
-                "V3.5 cannot run on this kernel/driver; "
-                "the normal V3.4 path remains valid.\n"
+                "DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP=yes "
+                "(legacy async=%" PRIu64 "); "
+                "the first frame will seed the plane synchronously.\n",
+                legacy_async_cap
             );
-
-            goto out;
         }
-
-        fprintf(
-            stderr,
-            "DRM_CAP_ASYNC_PAGE_FLIP=yes; "
-            "the first frame will seed the plane synchronously.\n"
-        );
+        else {
+            fprintf(
+                stderr,
+                "WARNING: DRM does not advertise atomic async page flips "
+                "(query=%s, value=%" PRIu64 ", legacy async=%" PRIu64 ").\n"
+                "V3.5 will issue one diagnostic atomic async commit; "
+                "EINVAL/unsupported is expected on Linux 6.1 and does not "
+                "invalidate the V3.4 baseline.\n",
+                atomic_cap_result == 0 ? "ok" : strerror(atomic_cap_errno),
+                atomic_async_cap,
+                legacy_async_cap
+            );
+        }
     }
 
 
