@@ -19,6 +19,10 @@ if [[ ! -x "$BIN" ]]; then
   echo "ERROR: $BIN not found; run 'make' first." >&2
   exit 1
 fi
+if ! [[ "$BUFFERS" =~ ^[0-9]+$ ]] || (( BUFFERS < 4 || BUFFERS > 8 )); then
+  echo "ERROR: BUFFERS must be 4..8 for a stable A/B run (got '$BUFFERS')." >&2
+  exit 2
+fi
 if ! "$BIN" --help 2>&1 | grep -q -- '--async-flip'; then
   echo "ERROR: binary does not contain the consolidated V3.5 async test." >&2
   exit 1
@@ -40,7 +44,18 @@ common=(
 
 echo "=== HDMI-RX / KMS V3.5 phase-bypass A/B test ==="
 echo "[1/2] normal atomic path"
+set +e
 "$BIN" "${common[@]}" --csv "$SYNC" >"$SLOG" 2>&1
+SRC=$?
+set -e
+
+if [[ $SRC -ne 0 || ! -s "$SYNC" ]]; then
+  echo "ERROR: normal baseline failed (exit=$SRC); async comparison was not started." >&2
+  echo "See: $SLOG" >&2
+  tail -n 80 "$SLOG" >&2 || true
+  [[ $SRC -ne 0 ]] && exit "$SRC"
+  exit 1
+fi
 
 echo "[2/2] DRM_MODE_PAGE_FLIP_ASYNC path (experimental)"
 set +e
@@ -53,11 +68,13 @@ if [[ $ARC -ne 0 || ! -s "$ASYNC" ]]; then
     python3 "$ROOT/tools/analyze.py" "$SYNC"
     echo
     echo "ASYNC run did not complete successfully (exit=$ARC)."
-    echo "This usually means the driver rejected async atomic flips or the path failed before producing samples."
+    echo "This usually means DRM_CAP_ASYNC_PAGE_FLIP is absent or the driver rejected the atomic async flip."
+    echo "That is a valid V3.5 result; the normal V3.4 baseline is still preserved."
     echo "See: $ALOG"
   } | tee "$REPORT"
   tail -n 80 "$ALOG" >&2 || true
-  exit 0
+  [[ $ARC -ne 0 ]] && exit "$ARC"
+  exit 1
 fi
 
 python3 "$ROOT/tools/analyze.py" "$SYNC" "$ASYNC" | tee "$REPORT"

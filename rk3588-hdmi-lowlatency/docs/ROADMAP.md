@@ -8,9 +8,9 @@ Success criteria:
 
 1. Native NV24 DMA-BUF zero-copy remains intact.
 2. Rockchip acquire fences are still consumed through `IN_FENCE_FD` with no FD leak.
-3. CRTC `OUT_FENCE_PTR` remains the display-side lifetime guard.
+3. The normal run retains `OUT_FENCE_PTR`; the async run waits its page-flip event as the lifetime guard required by the async UAPI.
 4. Four-buffer cadence remains stable.
-5. Async materially reduces `commit return → OUT` versus the normal run.
+5. Async materially reduces `commit return → completion event` versus normal `commit return → OUT`.
 6. No new full-frame userspace queue is introduced.
 
 If async is rejected by the driver, record that as the V3.5 result and move on; do not hide the failure behind a copy/conversion path.

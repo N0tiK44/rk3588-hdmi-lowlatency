@@ -19,6 +19,11 @@ if [[ ! -x "$BIN" ]]; then
   echo "ERROR: $BIN not found; run 'make' first." >&2
   exit 1
 fi
+if ! [[ "$BUFFERS" =~ ^[0-9]+$ ]] || (( BUFFERS < 4 || BUFFERS > 8 )); then
+  echo "ERROR: BUFFERS must be 4..8 for a stable run (got '$BUFFERS')." >&2
+  echo "Run the binary directly with --buffers 3 only to reproduce starvation." >&2
+  exit 2
+fi
 
 mkdir -p "$OUTDIR"
 CSV="$OUTDIR/baseline-b${BUFFERS}.csv"
@@ -39,10 +44,15 @@ RC=$?
 set -e
 
 if [[ -s "$CSV" ]]; then
-  python3 "$ROOT/tools/analyze.py" "$CSV" | tee "$REPORT"
+  if ! python3 "$ROOT/tools/analyze.py" "$CSV" | tee "$REPORT"; then
+    echo "ERROR: trace analysis failed. Raw CSV: $CSV" >&2
+    exit 1
+  fi
 else
   echo "No CSV was produced. Tail of log:" >&2
   tail -n 100 "$LOG" >&2 || true
+  [[ $RC -ne 0 ]] && exit "$RC"
+  exit 1
 fi
 
 if [[ $RC -ne 0 ]]; then

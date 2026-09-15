@@ -39,18 +39,18 @@ The program refuses scaling and requires the active CRTC mode to match the captu
 
 Rockchip's HDMI-RX driver exposes a sync-file FD in `v4l2_buffer.timecode.userbits`. The C path copies those bytes into a signed `int` and treats negative/`0xffffffff` as absent.
 
-For each dequeued frame:
+For each dequeued frame on the known-good normal path:
 
 1. `VIDIOC_DQBUF` returns a capture buffer.
 2. The Rockchip acquire-fence FD is extracted from `timecode.userbits`.
-3. If the selected plane exposes `IN_FENCE_FD`, that FD is supplied with the atomic plane update. If not, userspace waits it before commit as a fallback.
+3. The selected plane's `IN_FENCE_FD` property receives that FD. This property and a valid acquire fence are mandatory when Rockchip `low_latency` is enabled.
 4. The commit also supplies a userspace pointer through CRTC `OUT_FENCE_PTR`.
-5. `drmModeAtomicCommit()` is called with `DRM_MODE_ATOMIC_NONBLOCK`; V3.5 optionally ORs `DRM_MODE_PAGE_FLIP_ASYNC`.
+5. `drmModeAtomicCommit()` is called with `DRM_MODE_ATOMIC_NONBLOCK`.
 6. After the commit ioctl returns, userspace closes the input fence FD. KMS has consumed its reference as part of the property submission.
 7. Userspace waits for the returned KMS output fence, then closes that FD.
 8. Only after display completion is observed does userspace QBUF the *previously displayed* capture buffer back to HDMI-RX.
 
-`OUT_FENCE_PTR` is mandatory in this build because capture memory must not be returned to HDMI-RX while the display engine may still scan it.
+`OUT_FENCE_PTR` is mandatory in this build because the baseline must not return capture memory to HDMI-RX while the display engine may still scan it.
 
 ## Buffer ownership
 
@@ -93,11 +93,14 @@ Early V3 measurement packages could emit literal `\\n` sequences into CSV output
 
 ## V3.5 async experiment
 
-`--async-flip` changes only the atomic commit flags:
+Atomic async flips are more restricted than normal atomic commits. In particular, the request must be a pure framebuffer flip; changing `OUT_FENCE_PTR`, `CRTC_ID`, or geometry makes it an unsupported state change. The consolidated test therefore:
 
-```text
-normal: DRM_MODE_ATOMIC_NONBLOCK
-async:  DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_ASYNC
-```
+1. checks `DRM_CAP_ASYNC_PAGE_FLIP` before capture allocation,
+2. performs one normal full-state seed commit with `OUT_FENCE_PTR`,
+3. submits subsequent frames with only `FB_ID` and `IN_FENCE_FD`,
+4. uses `DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_ASYNC | DRM_MODE_PAGE_FLIP_EVENT`, and
+5. waits for the DRM page-flip event before returning the previous capture buffer.
 
-The DMA-BUF path, acquire fences, output fence, buffer count, framebuffer layout and ownership behavior remain otherwise identical. That makes the test useful as an A/B measurement of KMS display-phase behavior.
+The DMA-BUF layout, acquire-fence handoff, four-buffer pool, zero-copy behavior and ownership boundary remain comparable. Only the completion primitive differs: normal rows measure output-fence readiness; async rows measure page-flip event delivery. The CSV's `async_commit` column distinguishes the normal seed from true async rows, and the analyzer excludes the seed from async statistics.
+
+Kernel/driver support is not assumed. Linux 6.1 rejects the async flag for atomic commits. Newer DRM core code also requires the driver to advertise and implement async flips; upstream Rockchip VOP2 commonly does not. A clear nonzero “unsupported” result is therefore expected on many RK3588 images and does not invalidate V3.4.

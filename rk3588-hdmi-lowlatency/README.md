@@ -24,7 +24,7 @@ The active path has **no GStreamer, no CPU colour conversion, no framebuffer cop
 - zero-copy: V4L2 buffer → exported DMA-BUF → DRM PRIME import → KMS framebuffer
 - Rockchip HDMI-RX `low_latency`: enabled for a run and restored on exit
 - capture acquire fence: read from `v4l2_buffer.timecode.userbits`
-- KMS explicit sync: plane `IN_FENCE_FD` + CRTC `OUT_FENCE_PTR`
+- baseline explicit sync: plane `IN_FENCE_FD` + CRTC `OUT_FENCE_PTR`
 - stable capture pool: **4 buffers minimum** at the characterized ~60 Hz mode
 - current experiment: **V3.5 `DRM_MODE_PAGE_FLIP_ASYNC` A/B test**
 - long-term target: **1080p240**
@@ -70,12 +70,14 @@ Results go to `/tmp/hdmirx-baseline/`.
 sudo ./scripts/run-v35-phase.sh
 ```
 
-This performs two otherwise-equivalent runs:
+This performs two zero-copy runs:
 
-1. `DRM_MODE_ATOMIC_NONBLOCK`
-2. `DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_ASYNC`
+1. normal atomic commits with `IN_FENCE_FD` and `OUT_FENCE_PTR`
+2. one normal seed commit, then minimal `FB_ID` + `IN_FENCE_FD` commits with `DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_ASYNC | DRM_MODE_PAGE_FLIP_EVENT`
 
-Tearing is acceptable in the async run: V3.5 is a diagnostic test of display-phase bypass, not a presentation-quality mode. If the DRM driver rejects async atomic commits, the runner preserves the log and reports the normal trace rather than treating that result as useless.
+Atomic async flips cannot change `OUT_FENCE_PTR` or repeat unrelated plane state, so the async run uses the page-flip event as its completion/lifetime signal. The CSV labels the seed row and each async row. Tearing is acceptable: V3.5 is a diagnostic test of display-phase bypass, not a presentation-quality mode.
+
+The experiment is capability-gated with `DRM_CAP_ASYNC_PAGE_FLIP`. Linux 6.1 rejects async flags on atomic commits, and a newer kernel still needs explicit async support in the DRM driver/plane. Many RK3588 Rockchip/VOP2 kernels are therefore expected to report this test as unsupported. The runner preserves both logs and the normal trace, then exits nonzero so an unsupported async result cannot be mistaken for success.
 
 Results go to `/tmp/hdmirx-v35/`.
 
@@ -95,7 +97,7 @@ python3 tools/analyze.py \
 
 ## Important ownership rule
 
-The input fence FD extracted from the Rockchip V4L2 extension is passed to KMS through `IN_FENCE_FD` when available and then closed by userspace after the atomic commit ioctl returns. The output fence FD returned through `OUT_FENCE_PTR` is waited and closed before the previously displayed capture buffer is QBUF'd back to HDMI-RX. Do not remove this ownership discipline merely to shorten code.
+The input fence FD extracted from the Rockchip V4L2 extension is passed to KMS through `IN_FENCE_FD` and then closed by userspace after the atomic commit ioctl returns. On the normal path, the output fence FD returned through `OUT_FENCE_PTR` is waited and closed before the previously displayed capture buffer is QBUF'd back to HDMI-RX. On the async experiment, the corresponding page-flip event is awaited before that requeue. Do not remove this ownership discipline merely to shorten code.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the exact lifetime.
 
@@ -122,26 +124,26 @@ git init
 git add .
 git commit -m "Consolidated RK3588 HDMI-RX baseline"
 git branch -M main
-git tag -a v3.5-consolidated-baseline -m "Known-good four-buffer explicit-sync baseline"
+git tag -a v3.4-known-good -m "Known-good four-buffer explicit-sync baseline"
 ```
 
 Create each risky experiment on a branch from that tag:
 
 ```bash
-git switch -c experiment/v3.6-phase-control v3.5-consolidated-baseline
+git switch -c experiment/v3.5-async v3.4-known-good
 ```
 
 Commit small, testable changes. To abandon an experiment safely:
 
 ```bash
 git switch main
-git branch -D experiment/v3.6-phase-control
+git branch -D experiment/v3.5-async
 ```
 
 To reproduce the exact known-good baseline at any time:
 
 ```bash
-git switch --detach v3.5-consolidated-baseline
+git switch --detach v3.4-known-good
 ```
 
 When an experiment is proven, merge it to `main` and create a new annotated tag (for example `v3.6-phase-control`). Never use patch-application scripts as the versioning system.
@@ -151,6 +153,7 @@ When an experiment is proven, merge it to `main` and create a new annotated tag 
 - `docs/ARCHITECTURE.md` — datapath, explicit sync, ownership and instrumentation
 - `docs/ROADMAP.md` — V3.5 onward and 1080p240 target
 - `docs/DEVELOPMENT_HISTORY.md` — consolidated history and historical-package issues
+- `docs/VERSIONING.md` — rollback-safe tags and experiment branches
 - `docs/results/v3.3-buffer-sweep.md` — buffer-count conclusion
 - `docs/results/v3.4-buffer-lifetime.md` — measured phase/ownership result
 

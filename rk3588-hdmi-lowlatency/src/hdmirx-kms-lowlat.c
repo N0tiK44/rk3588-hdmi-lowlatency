@@ -1,8 +1,9 @@
-﻿#define _GNU_SOURCE
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -65,6 +66,7 @@ struct frame_sample {
     uint32_t sequence;
     uint32_t index;
     int fence_present;
+    int async_commit;
 
     uint64_t v4l2_ts_ns;
     uint64_t dq_ns;
@@ -318,13 +320,13 @@ static void v3_print_summary(void)
     );
 
     v3_metric(
-        "commit return -> OUT fence",
+        "commit return -> completion",
         commit_out,
         stage_n
     );
 
     v3_metric(
-        "DQBUF -> OUT fence",
+        "DQBUF -> completion",
         dq_out,
         stage_n
     );
@@ -355,6 +357,7 @@ static int v3_write_csv(const char* path)
         "sequence,"
         "index,"
         "fence_present,"
+        "async_commit,"
         "v4l2_ts_ns,"
         "dq_ns,"
         "commit_begin_ns,"
@@ -409,6 +412,7 @@ static int v3_write_csv(const char* path)
             "%u,"
             "%u,"
             "%d,"
+            "%d,"
             "%" PRIu64 ","
             "%" PRIu64 ","
             "%" PRIu64 ","
@@ -424,6 +428,7 @@ static int v3_write_csv(const char* path)
             x->sequence,
             x->index,
             x->fence_present,
+            x->async_commit,
             x->v4l2_ts_ns,
             x->dq_ns,
             x->commit_begin_ns,
@@ -516,6 +521,37 @@ static int xioctl(int fd, unsigned long req, void* arg)
 }
 
 
+static int parse_u32_arg(const char* text, uint32_t* value)
+{
+    char* end = NULL;
+    errno = 0;
+    unsigned long parsed = strtoul(text, &end, 0);
+
+    if (errno || end == text || *end != '\0' || parsed > UINT32_MAX)
+        return -1;
+
+    *value = (uint32_t)parsed;
+    return 0;
+}
+
+
+static int parse_int_arg(const char* text, int* value)
+{
+    char* end = NULL;
+    errno = 0;
+    long parsed = strtol(text, &end, 10);
+
+    if (errno || end == text || *end != '\0' ||
+        parsed < INT_MIN || parsed > INT_MAX) {
+
+        return -1;
+    }
+
+    *value = (int)parsed;
+    return 0;
+}
+
+
 static int wait_fd(int fd, int timeout_ms)
 {
     struct pollfd p = {
@@ -534,7 +570,105 @@ static int wait_fd(int fd, int timeout_ms)
         return -1;
     }
 
-    return r < 0 ? -1 : 0;
+    if (r < 0)
+        return -1;
+
+    if (p.revents & POLLNVAL) {
+        errno = EBADF;
+        return -1;
+    }
+
+    if (p.revents & (POLLERR | POLLHUP)) {
+        errno = EIO;
+        return -1;
+    }
+
+    if (!(p.revents & POLLIN)) {
+        errno = EIO;
+        return -1;
+    }
+
+    return 0;
+}
+
+
+struct flip_wait {
+    bool done;
+    uint64_t signal_ns;
+};
+
+
+static void page_flip_handler(
+    int fd,
+    unsigned int sequence,
+    unsigned int tv_sec,
+    unsigned int tv_usec,
+    void* user_data
+)
+{
+    (void)fd;
+    (void)sequence;
+    (void)tv_sec;
+    (void)tv_usec;
+
+    struct flip_wait* wait = user_data;
+
+    wait->signal_ns = v3_mono_ns();
+    wait->done = true;
+}
+
+
+static int wait_flip_event(
+    int drmfd,
+    struct flip_wait* wait,
+    int timeout_ms
+)
+{
+    drmEventContext event = {
+        .version = DRM_EVENT_CONTEXT_VERSION,
+        .page_flip_handler = page_flip_handler,
+    };
+
+    while (!wait->done) {
+        struct pollfd p = {
+            .fd = drmfd,
+            .events = POLLIN,
+        };
+
+        int r;
+
+        do {
+            r = poll(&p, 1, timeout_ms);
+        } while (r < 0 && errno == EINTR && !g_stop);
+
+        if (r == 0) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+
+        if (r < 0)
+            return -1;
+
+        if (p.revents & POLLNVAL) {
+            errno = EBADF;
+            return -1;
+        }
+
+        if (p.revents & (POLLERR | POLLHUP)) {
+            errno = EIO;
+            return -1;
+        }
+
+        if (!(p.revents & POLLIN)) {
+            errno = EIO;
+            return -1;
+        }
+
+        if (drmHandleEvent(drmfd, &event) < 0)
+            return -1;
+    }
+
+    return 0;
 }
 
 
@@ -1134,6 +1268,52 @@ static int add_plane_props(
 }
 
 
+/*
+ * Atomic async flips are deliberately restricted to a pure framebuffer
+ * replacement (plus the acquire fence).  Re-submitting CRTC_ID, geometry or
+ * OUT_FENCE_PTR turns the request into a state change that the atomic async
+ * UAPI rejects.
+ */
+static int add_async_plane_props(
+    drmModeAtomicReq* req,
+    uint32_t plane_id,
+    const struct drm_props* pp,
+    uint32_t fb_id,
+    int in_fence_fd
+)
+{
+    if (!pp->fb_id) {
+        errno = ENOENT;
+        return -1;
+    }
+
+    if (drmModeAtomicAddProperty(
+        req,
+        plane_id,
+        pp->fb_id,
+        fb_id) < 0) {
+
+        return -1;
+    }
+
+    if (pp->in_fence_fd &&
+        in_fence_fd >= 0) {
+
+        if (drmModeAtomicAddProperty(
+            req,
+            plane_id,
+            pp->in_fence_fd,
+            (uint64_t)(int64_t)
+            in_fence_fd) < 0) {
+
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+
 /* ------------------------------------------------------------------------- */
 /* CLI                                                                       */
 /* ------------------------------------------------------------------------- */
@@ -1316,31 +1496,43 @@ int main(
             break;
 
         case 3:
-            o.connector_id =
-                strtoul(
-                    optarg,
-                    NULL,
-                    0
-                );
+            if (parse_u32_arg(
+                optarg,
+                &o.connector_id) < 0) {
+
+                fprintf(stderr, "Invalid connector ID: %s\n", optarg);
+                return 2;
+            }
             break;
 
         case 4:
-            o.plane_id =
-                strtoul(
-                    optarg,
-                    NULL,
-                    0
-                );
+            if (parse_u32_arg(
+                optarg,
+                &o.plane_id) < 0) {
+
+                fprintf(stderr, "Invalid plane ID: %s\n", optarg);
+                return 2;
+            }
             break;
 
         case 5:
-            o.seconds =
-                atoi(optarg);
+            if (parse_int_arg(
+                optarg,
+                &o.seconds) < 0) {
+
+                fprintf(stderr, "Invalid duration: %s\n", optarg);
+                return 2;
+            }
             break;
 
         case 6:
-            o.num_buffers =
-                atoi(optarg);
+            if (parse_int_arg(
+                optarg,
+                &o.num_buffers) < 0) {
+
+                fprintf(stderr, "Invalid buffer count: %s\n", optarg);
+                return 2;
+            }
             break;
 
         case 7:
@@ -1374,7 +1566,8 @@ int main(
     }
 
 
-    if (o.num_buffers < 3 ||
+    if (optind != argc ||
+        o.num_buffers < 3 ||
         o.num_buffers > MAX_BUFS ||
         o.seconds < 1) {
 
@@ -1618,6 +1811,33 @@ int main(
     }
 
 
+    uint64_t nv24_required =
+        (uint64_t)bpl *
+        (uint64_t)h *
+        3ULL;
+
+
+    if (bpl < w ||
+        bpl > UINT32_MAX / 2U ||
+        nv24_required > UINT32_MAX ||
+        sizeimage < nv24_required) {
+
+        fprintf(
+            stderr,
+            "Unsafe or unsupported NV24 layout: "
+            "width=%u height=%u bytesperline=%u "
+            "sizeimage=%u required=%" PRIu64 ".\n",
+            w,
+            h,
+            bpl,
+            sizeimage,
+            nv24_required
+        );
+
+        goto out;
+    }
+
+
     /* --------------------------------------------------------------------- */
     /* Open DRM                                                              */
     /* --------------------------------------------------------------------- */
@@ -1658,6 +1878,37 @@ int main(
         );
 
         goto out;
+    }
+
+
+    if (o.async_flip) {
+        uint64_t async_cap = 0;
+
+        if (drmGetCap(
+            drmfd,
+            DRM_CAP_ASYNC_PAGE_FLIP,
+            &async_cap) < 0) {
+
+            perror("DRM_CAP_ASYNC_PAGE_FLIP");
+            goto out;
+        }
+
+        if (!async_cap) {
+            fprintf(
+                stderr,
+                "DRM reports no asynchronous page-flip support.\n"
+                "V3.5 cannot run on this kernel/driver; "
+                "the normal V3.4 path remains valid.\n"
+            );
+
+            goto out;
+        }
+
+        fprintf(
+            stderr,
+            "DRM_CAP_ASYNC_PAGE_FLIP=yes; "
+            "the first frame will seed the plane synchronously.\n"
+        );
     }
 
 
@@ -1967,6 +2218,20 @@ int main(
     );
 
 
+    if (o.enable_low_latency &&
+        !pp.in_fence_fd) {
+
+        fprintf(
+            stderr,
+            "IN_FENCE_FD is mandatory while Rockchip low_latency is enabled.\n"
+            "Refusing to run the characterized path with implicit or "
+            "userspace-only synchronization.\n"
+        );
+
+        goto out;
+    }
+
+
     if (!pp.out_fence_ptr) {
         fprintf(
             stderr,
@@ -2018,12 +2283,16 @@ int main(
     }
 
 
-    if ((int)req.count < 3) {
+    if (req.count <
+        (uint32_t)o.num_buffers) {
+
         fprintf(
             stderr,
-            "Driver returned only "
-            "%u buffers.\n",
-            req.count
+            "Driver returned only %u of the requested %d buffers.\n"
+            "Aborting instead of silently running below the selected "
+            "capture-pool size.\n",
+            req.count,
+            o.num_buffers
         );
 
         goto out;
@@ -2086,6 +2355,22 @@ int main(
 
             perror(
                 "VIDIOC_QUERYBUF"
+            );
+
+            goto out;
+        }
+
+
+        if ((uint64_t)qp[0].length <
+            nv24_required) {
+
+            fprintf(
+                stderr,
+                "V4L2 buffer %u is too small: "
+                "length=%u required=%" PRIu64 ".\n",
+                i,
+                qp[0].length,
+                nv24_required
             );
 
             goto out;
@@ -2357,6 +2642,22 @@ int main(
         }
 
 
+        if (vp.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            fprintf(
+                stderr,
+                "V4L2 poll reported device error (revents=0x%x).\n",
+                vp.revents
+            );
+
+            run_failed = true;
+            break;
+        }
+
+
+        if (!(vp.revents & (POLLIN | POLLPRI)))
+            continue;
+
+
         struct v4l2_buffer b;
         struct v4l2_plane
             p[VIDEO_MAX_PLANES];
@@ -2431,6 +2732,17 @@ int main(
                 "Rockchip fence fd\n",
                 frames
             );
+
+            if (o.enable_low_latency) {
+                fprintf(
+                    stderr,
+                    "Acquire fences are mandatory in the characterized "
+                    "Rockchip low-latency path.\n"
+                );
+
+                run_failed = true;
+                break;
+            }
         }
 
 
@@ -2466,7 +2778,16 @@ int main(
         }
 
 
+        const bool async_this_commit =
+            o.async_flip &&
+            displayed >= 0;
+
         int out_fence = -1;
+
+        struct flip_wait flip = {
+            .done = false,
+            .signal_ns = 0,
+        };
 
 
         drmModeAtomicReq* ar =
@@ -2487,19 +2808,40 @@ int main(
         }
 
 
-        if (add_plane_props(
-            drmfd,
-            ar,
-            plane->plane_id,
-            &pp,
-            crtc_id,
-            bufs[b.index].fb_id,
-            w,
-            h,
-            in_fence) < 0) {
+        int add_result;
+
+        if (async_this_commit) {
+            add_result =
+                add_async_plane_props(
+                    ar,
+                    plane->plane_id,
+                    &pp,
+                    bufs[b.index].fb_id,
+                    in_fence
+                );
+        }
+        else {
+            add_result =
+                add_plane_props(
+                    drmfd,
+                    ar,
+                    plane->plane_id,
+                    &pp,
+                    crtc_id,
+                    bufs[b.index].fb_id,
+                    w,
+                    h,
+                    in_fence
+                );
+        }
+
+
+        if (add_result < 0) {
 
             perror(
-                "add plane props"
+                async_this_commit
+                ? "add async plane props"
+                : "add plane props"
             );
 
             drmModeAtomicFree(ar);
@@ -2512,7 +2854,8 @@ int main(
         }
 
 
-        if (drmModeAtomicAddProperty(
+        if (!async_this_commit &&
+            drmModeAtomicAddProperty(
             ar,
             crtc_id,
             pp.out_fence_ptr,
@@ -2542,16 +2885,10 @@ int main(
             DRM_MODE_ATOMIC_NONBLOCK;
 
 
-        /*
-         * V3.5 controlled experiment.
-         *
-         * This is intentionally the only
-         * presentation-path difference
-         * between normal and async runs.
-         */
-        if (o.async_flip) {
+        if (async_this_commit) {
             commit_flags |=
-                DRM_MODE_PAGE_FLIP_ASYNC;
+                DRM_MODE_PAGE_FLIP_ASYNC |
+                DRM_MODE_PAGE_FLIP_EVENT;
         }
 
 
@@ -2560,7 +2897,9 @@ int main(
                 drmfd,
                 ar,
                 commit_flags,
-                NULL
+                async_this_commit
+                ? &flip
+                : NULL
             );
 
 
@@ -2594,12 +2933,23 @@ int main(
                 "drmModeAtomicCommit"
             );
 
+            if (async_this_commit) {
+                fprintf(
+                    stderr,
+                    "The kernel/driver rejected the pure async flip. "
+                    "This is a valid V3.5 unsupported result, not a "
+                    "V3.4 baseline failure.\n"
+                );
+            }
+
             run_failed = true;
             break;
         }
 
 
-        if (out_fence < 0) {
+        if (!async_this_commit &&
+            out_fence < 0) {
+
             fprintf(
                 stderr,
                 "Atomic commit succeeded "
@@ -2612,41 +2962,44 @@ int main(
         }
 
 
-        /*
-         * Current V3.4/V3.5 ownership model:
-         *
-         * wait until KMS says the submitted
-         * display update has completed before
-         * recycling the previously displayed
-         * capture buffer.
-         *
-         * Do NOT casually remove this wait.
-         */
-        if (wait_fd(
-            out_fence,
-            1000) < 0) {
-
-            perror(
-                "wait KMS out-fence"
-            );
-
-            close(
-                out_fence
-            );
-
-            run_failed = true;
-            break;
-        }
+        uint64_t v3_out_signal_ns;
 
 
-        const uint64_t
+        if (async_this_commit) {
+            if (wait_flip_event(
+                drmfd,
+                &flip,
+                1000) < 0) {
+
+                perror("wait async page-flip event");
+                run_failed = true;
+                break;
+            }
+
             v3_out_signal_ns =
-            v3_mono_ns();
+                flip.signal_ns;
+        }
+        else {
+            /*
+             * Normal V3.4 path: OUT_FENCE_PTR remains the display-side
+             * lifetime guard.  The async UAPI cannot accept this changing
+             * CRTC property, so V3.5 uses the page-flip completion event.
+             */
+            if (wait_fd(
+                out_fence,
+                1000) < 0) {
 
+                perror("wait KMS out-fence");
+                close(out_fence);
+                run_failed = true;
+                break;
+            }
 
-        close(
-            out_fence
-        );
+            v3_out_signal_ns =
+                v3_mono_ns();
+
+            close(out_fence);
+        }
 
 
         /* ------------------------------------------------------------- */
@@ -2673,6 +3026,9 @@ int main(
 
             vs->fence_present =
                 in_fence >= 0;
+
+            vs->async_commit =
+                async_this_commit;
 
             vs->v4l2_ts_ns =
                 v3_v4l2_ts_ns;

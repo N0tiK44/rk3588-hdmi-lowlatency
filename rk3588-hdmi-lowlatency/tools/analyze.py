@@ -66,6 +66,14 @@ def load_csv(path):
 
 def analyze(path):
     rows = load_csv(path)
+    sync_rows = sum(integer(row.get("async_commit")) == 0 for row in rows)
+    async_rows = sum(integer(row.get("async_commit")) == 1 for row in rows)
+
+    # V3.5 starts with one normal commit to establish the plane, then issues
+    # pure async FB flips. Exclude that seed commit from an async trace.
+    if async_rows:
+        rows = [row for row in rows if integer(row.get("async_commit")) == 1]
+
     metrics = defaultdict(list)
     seq_gaps = 0
     missing_fences = 0
@@ -126,6 +134,8 @@ def analyze(path):
     return {
         "path": str(path),
         "rows": len(rows),
+        "sync_rows": sync_rows,
+        "async_rows": async_rows,
         "sequence_gaps": seq_gaps,
         "missing_fences": missing_fences,
         "metrics": metrics,
@@ -148,6 +158,11 @@ def metric_line(label, xs):
 def show(label, result):
     m = result["metrics"]
     print(f"{label}: {result['path']} ({result['rows']} post-warmup rows)")
+    if result["sync_rows"] or result["async_rows"]:
+        print(
+            f"  commit modes: normal={result['sync_rows']} "
+            f"async={result['async_rows']}"
+        )
     print(f"  sequence gaps: {result['sequence_gaps']}   missing acquire fences: {result['missing_fences']}")
     print(metric_line("V4L2 timestamp cadence", m["v4l2_period"]))
     print(metric_line("DQ -> next DQ", m["dq_period"]))
@@ -156,9 +171,9 @@ def show(label, result):
     print(metric_line("previous OUT -> commit", m["prev_out_to_commit"]))
     print(metric_line("DQ -> commit call", m["dq_to_commit_begin"]))
     print(metric_line("atomic commit ioctl", m["commit_ioctl"]))
-    print(metric_line("commit return -> OUT", m["commit_to_out"]))
-    print(metric_line("DQ -> OUT", m["dq_to_out"]))
-    print(metric_line("own OUT -> QBUF", m["own_out_to_qbuf"]))
+    print(metric_line("commit -> completion", m["commit_to_out"]))
+    print(metric_line("DQ -> completion", m["dq_to_out"]))
+    print(metric_line("own completion -> QBUF", m["own_out_to_qbuf"]))
     print(metric_line("same-buffer DQ reuse", m["same_buffer_reuse"]))
     if result["per_index_reuse"]:
         parts = []
@@ -182,7 +197,7 @@ def main(argv):
         a = median(async_result["metrics"]["commit_to_out"])
         gain = n - a
         print()
-        print(f"Async commit->OUT median improvement: {gain / 1000.0:.3f} ms")
+        print(f"Async completion median improvement: {gain / 1000.0:.3f} ms")
         if a < 0.5 * n:
             print("Interpretation: major display-phase bypass detected.")
         elif gain > 1000.0:
