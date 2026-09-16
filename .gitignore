@@ -1,0 +1,18 @@
+# Native build products
+/rk3588-hdmi-passthrough
+*.o
+
+# Measurement output
+*.csv
+*.log
+report.txt
+*.tar.gz
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Editor and operating-system files
+*~
+*.swp
+.DS_Store
