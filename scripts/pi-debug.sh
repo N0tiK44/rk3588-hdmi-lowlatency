@@ -4,11 +4,11 @@ set -euo pipefail
 # Small bootstrap kept separate from the runner so a pull can safely replace the
 # worker before it is executed.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-EXPERIMENT="${1:-v38}"
+EXPERIMENT="${1:-v381}"
 
 usage() {
   cat <<'EOF'
-Usage: bash scripts/pi-debug.sh [baseline|v35|v36|v37|v38]
+Usage: bash scripts/pi-debug.sh [baseline|v35|v36|v37|v38|v381]
 
 From the existing Orange Pi checkout this performs a safe fast-forward update,
 builds and checks the project, runs the selected hardware test, and creates:
@@ -26,7 +26,7 @@ if [[ "$EXPERIMENT" == "-h" || "$EXPERIMENT" == "--help" ]]; then
 fi
 
 case "$EXPERIMENT" in
-  baseline|v35|v36|v37|v38) ;;
+  baseline|v35|v36|v37|v38|v381) ;;
   *)
     echo "ERROR: unknown experiment '$EXPERIMENT'." >&2
     usage >&2

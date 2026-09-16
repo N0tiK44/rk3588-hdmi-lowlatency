@@ -10,7 +10,7 @@ From any directory, run the existing checkout's bootstrap as the normal login
 user:
 
 ```bash
-bash ~/src/rk3588-hdmi-lowlatency/scripts/pi-debug.sh v38
+bash ~/src/rk3588-hdmi-lowlatency/scripts/pi-debug.sh v381
 ```
 
 Do **not** put `sudo` before this command. The script requests sudo only for the
@@ -28,7 +28,8 @@ The wrapper packages results even when an experimental kernel operation is
 unsupported or the runner exits nonzero. A build/check failure prevents the
 hardware test but is also recorded and packaged.
 
-Supported selectors are `baseline`, `v35`, `v36`, `v37`, and `v38`. V3.8 is the
+Supported selectors are `baseline`, `v35`, `v36`, `v37`, `v38`, and `v381`.
+V3.8 is retained only to print its retirement warning. V3.8.1 is the
 default, so this shorter command is equivalent:
 
 ```bash
@@ -39,7 +40,7 @@ Optional overrides remain available without editing files:
 
 ```bash
 DURATION=300 TARGET_MILLIHZ=59940 \
-  bash ~/src/rk3588-hdmi-lowlatency/scripts/pi-debug.sh v38
+  bash ~/src/rk3588-hdmi-lowlatency/scripts/pi-debug.sh v381
 ```
 
 ## Windows PC

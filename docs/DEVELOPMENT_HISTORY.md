@@ -27,7 +27,8 @@ This repository was reconstructed from the historical project packages and inten
 | V3.5 | Async phase experiment | Linux 6.1 Rockchip/VOP2 rejected the atomic async commit; normal baseline remained valid. |
 | V3.6 | Phase profiler | Found 59.94/60.000 Hz cadence wraps: eight two-vblank completions in 7,126 post-warmup frames with no capture gaps. |
 | V3.7 | Cadence alignment | A/B tests unchanged timing against an EDID-advertised 59.94 Hz mode and restores the original mode. Current stage. |
-| V3.8 | Early submission | One controlled overlapping atomic commit, with an ownership-safe annotated phase-prime fallback when Linux 6.1 returns `EBUSY`. Current experiment. |
+| V3.8 | Early submission | `EBUSY` plus the intentional drop caused a two-vblank completion and added one visible frame. Retired negative result. |
+| V3.8.1 | Safe window profiler | Classifies readiness using the actual CRTC sequence without DQ, overlap, or frame drop. Current experiment. |
 
 ## Consolidation decisions
 

@@ -39,20 +39,27 @@ Run a controlled A/B comparison between the existing active timing and an EDID-a
 
 Primary success criterion: eliminate or materially reduce the periodic two-vblank events. The normal one-vblank completion delay is expected to remain and will be addressed separately after cadence stability is proven.
 
-## V3.8 — current: controlled early submission
+## V3.8 — completed negative result
 
 Keep the verified advertised 59.940 Hz output timing and test whether a capture
 buffer can be submitted while the preceding atomic update is still pending.
 Make exactly one overlapping nonblocking commit after warm-up. Record kernel
 acceptance, `EBUSY`, or another rejection separately.
 
-On rejection, safely wait the candidate acquire fence and perform one annotated
-phase-prime drop. Compare the remainder of the arm against an aligned reference
-to learn whether shifting capture ownership phase can reduce the normal
-one-vblank completion wait. No pixel copy, conversion, extra queue, synthetic
-mode, or unguarded QBUF is permitted.
+Hardware showed that the readiness race occurred after physical vblank but
+before the OUT sync-file became readable. The overlap returned `EBUSY`; dropping
+that capture caused the next commit to span two vblanks and added one frame.
+The experimental drop is retired.
 
-V3.8.x is reserved for narrow follow-ups based on the hardware result. V3.9 is
+## V3.8.1 — current: safe early-window classification
+
+Observe V4L2/OUT readiness continuously after warm-up and query the CRTC
+sequence at each capture-ready-first race. Separate genuine pre-latch windows
+from post-latch fence-notification lag. Do not DQ, overlap, drop, or otherwise
+change the proven datapath inside the probe. Use one uninterrupted arm so a
+second modeset cannot contaminate the camera comparison.
+
+Further V3.8.x revisions are reserved for narrow phase follow-ups. V3.9 is
 the EDID-forwarding/identity stage after the latency behavior is characterized.
 
 ## High-refresh validation

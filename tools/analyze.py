@@ -235,10 +235,12 @@ def show(label, result):
         f"missing acquire fences: {result['missing_fences']}"
     )
     if result["early_rows"]:
-        print(
-            f"  V3.8 early-submit rows: {result['early_rows']}   "
-            f"accepted overlap rows: {result['overlap_rows']}"
-        )
+        print(f"  early-window profiler rows: {result['early_rows']}")
+        if result["overlap_rows"] or result["intentional_drops"]:
+            print(
+                f"  V3.8 overlap rows: {result['overlap_rows']}   "
+                f"intentional drops: {result['intentional_drops']}"
+            )
     for title, key in (
         ("V4L2 timestamp cadence", "v4l2_period"), ("DQ -> next DQ", "dq_period"),
         ("OUT -> next OUT", "out_period"), ("previous OUT -> DQ", "prev_out_to_dq"),

@@ -101,19 +101,19 @@ These extra ioctls are diagnostic overhead and V3.6 does not claim they reduce l
 
 V3.7 optionally selects a 1920×1080 connector mode within 0.005 Hz of the requested millihertz value. The candidate must come directly from the connector's EDID mode list. The program creates atomic mode blobs, includes connector `CRTC_ID` plus CRTC `MODE_ID`/`ACTIVE` in the first normal NV24 commit, and uses `DRM_MODE_ATOMIC_ALLOW_MODESET`.
 
-## V3.8 controlled overlap and phase-prime
+## V3.8 negative result and V3.8.1 correction
 
-After warm-up, V3.8 polls the current KMS output fence and HDMI-RX capture fd
-together. A capture-ready-first result triggers exactly one second
-`DRM_MODE_ATOMIC_NONBLOCK` request while the preceding update is pending. The
-new request has its own `IN_FENCE_FD` and `OUT_FENCE_PTR`.
+V3.8 showed that sync-file readability is not the physical latch boundary. A
+capture-ready event arrived after the CRTC sequence advanced but before the OUT
+fence became readable. Treating that as a pre-latch opportunity led to an
+`EBUSY`, an intentional dropped capture, and a two-vblank next completion.
 
-If the kernel rejects it, the program retains ownership of the candidate,
-waits its producer fence, closes that fence, and only then QBUFs it. This single
-intentional capture drop is annotated on the next CSV sample. If the overlap is
-accepted, both display fences are waited in submission order before the
-superseded capture buffer is returned. Thus neither result requeues a buffer
-while capture or scanout may still own it.
+V3.8.1 retains the two-fd poll only as an observation. On capture-ready-first,
+it calls `drmCrtcGetSequence()` and compares the result with the sequence taken
+immediately before the current commit. It does not call `VIDIOC_DQBUF` inside
+the probe. The buffer remains queued until the current OUT fence completes and
+the ordinary next loop iteration consumes it. Consequently the profiler cannot
+change capture order, KMS ownership, buffer cadence, or displayed latency.
 
 The capture format, plane, DMA-BUF objects, acquire fences, output fences and four-buffer ownership rule remain unchanged. When the selected timing differs from the startup timing, cleanup disables the experiment plane and atomically restores the original CRTC mode before framebuffer removal. Failure to find, apply or restore the advertised mode is a failed experiment; there is no synthetic-timing fallback.
 

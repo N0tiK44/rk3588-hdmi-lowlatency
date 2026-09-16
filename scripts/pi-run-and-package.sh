@@ -2,7 +2,7 @@
 set -u -o pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-EXPERIMENT="${1:-v38}"
+EXPERIMENT="${1:-v381}"
 RESULTS_BASE="${RESULTS_BASE:-$HOME/hdmirx-results}"
 BUFFERS="${BUFFERS:-4}"
 VIDEO="${VIDEO:-/dev/video0}"
@@ -30,6 +30,10 @@ case "$EXPERIMENT" in
     ;;
   v38)
     RUNNER="$ROOT/scripts/run-v38-early-submit.sh"
+    DEFAULT_DURATION=120
+    ;;
+  v381)
+    RUNNER="$ROOT/scripts/run-v381-safe-window.sh"
     DEFAULT_DURATION=120
     ;;
   *)
