@@ -2,7 +2,7 @@
 set -u -o pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-EXPERIMENT="${1:-v37}"
+EXPERIMENT="${1:-v38}"
 RESULTS_BASE="${RESULTS_BASE:-$HOME/hdmirx-results}"
 BUFFERS="${BUFFERS:-4}"
 VIDEO="${VIDEO:-/dev/video0}"
@@ -26,6 +26,10 @@ case "$EXPERIMENT" in
     ;;
   v37)
     RUNNER="$ROOT/scripts/run-v37-cadence-alignment.sh"
+    DEFAULT_DURATION=120
+    ;;
+  v38)
+    RUNNER="$ROOT/scripts/run-v38-early-submit.sh"
     DEFAULT_DURATION=120
     ;;
   *)

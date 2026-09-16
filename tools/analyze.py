@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze RK3588 HDMI-RX/KMS V3.4-V3.7 timing CSV traces."""
+"""Analyze RK3588 HDMI-RX/KMS V3.4-V3.8 timing CSV traces."""
 from __future__ import annotations
 
 import csv
@@ -76,6 +76,9 @@ def analyze(path):
     rows = load_csv(path)
     sync_rows = sum(integer(r.get("async_commit")) == 0 for r in rows)
     async_rows = sum(integer(r.get("async_commit")) == 1 for r in rows)
+    early_rows = sum(integer(r.get("early_submit")) == 1 for r in rows)
+    overlap_rows = sum(integer(r.get("overlap_commit")) == 1 for r in rows)
+    intentional_drops = sum(integer(r.get("intentional_drops_before")) or 0 for r in rows)
     if async_rows:
         rows = [r for r in rows if integer(r.get("async_commit")) == 1]
 
@@ -192,7 +195,10 @@ def analyze(path):
     ]
     return {
         "path": str(path), "rows": len(rows), "sync_rows": sync_rows,
-        "async_rows": async_rows, "seq_gaps": seq_gaps,
+        "async_rows": async_rows, "early_rows": early_rows,
+        "overlap_rows": overlap_rows, "seq_gaps": seq_gaps,
+        "intentional_drops": intentional_drops,
+        "unexpected_gaps": max(0, seq_gaps - intentional_drops),
         "missing_fences": missing_fences, "metrics": metrics,
         "per_index_reuse": per_index_reuse, "phase_rows": phase_rows,
         "monotonic_rows": monotonic_rows, "soe_rows": soe_rows,
@@ -222,7 +228,17 @@ def show(label, result):
     m = result["metrics"]
     print(f"{label}: {result['path']} ({result['rows']} post-warmup rows)")
     print(f"  commit modes: normal={result['sync_rows']} async={result['async_rows']}")
-    print(f"  sequence gaps: {result['seq_gaps']}   missing acquire fences: {result['missing_fences']}")
+    print(
+        "  sequence gaps: "
+        f"raw={result['seq_gaps']} intentional={result['intentional_drops']} "
+        f"unexpected={result['unexpected_gaps']}   "
+        f"missing acquire fences: {result['missing_fences']}"
+    )
+    if result["early_rows"]:
+        print(
+            f"  V3.8 early-submit rows: {result['early_rows']}   "
+            f"accepted overlap rows: {result['overlap_rows']}"
+        )
     for title, key in (
         ("V4L2 timestamp cadence", "v4l2_period"), ("DQ -> next DQ", "dq_period"),
         ("OUT -> next OUT", "out_period"), ("previous OUT -> DQ", "prev_out_to_dq"),
@@ -272,7 +288,8 @@ def main(argv):
         comparison = analyze(argv[2])
         print()
         is_async = comparison["async_rows"] > 0
-        show("ASYNC" if is_async else "ALIGNED", comparison)
+        is_early = comparison["early_rows"] > 0
+        show("ASYNC" if is_async else ("EARLY" if is_early else "ALIGNED"), comparison)
         gain = median(normal["metrics"]["commit_to_out"]) - median(comparison["metrics"]["commit_to_out"])
         print(f"\nCompletion median improvement: {gain / 1000.0:.3f} ms")
         print(

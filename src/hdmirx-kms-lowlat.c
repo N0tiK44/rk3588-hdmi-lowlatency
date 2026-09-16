@@ -75,6 +75,9 @@ struct frame_sample {
     uint32_t index;
     int fence_present;
     int async_commit;
+    int early_submit;
+    int overlap_commit;
+    uint32_t intentional_drops_before;
 
     uint64_t v4l2_ts_ns;
     uint64_t dq_ns;
@@ -359,9 +362,11 @@ static void v3_print_summary(void)
     size_t stage_n = 0;
 
     uint64_t seq_gaps = 0;
+    uint64_t intentional_drops = 0;
 
     for (size_t i = 0; i < g_sample_count; i++) {
         const struct frame_sample* x = &g_samples[i];
+        intentional_drops += x->intentional_drops_before;
 
         if (i) {
             const struct frame_sample* p =
@@ -423,8 +428,11 @@ static void v3_print_summary(void)
 
     fprintf(
         stderr,
-        "V4L2 sequence gaps             : %" PRIu64 "\n",
-        seq_gaps
+        "V4L2 sequence gaps             : %" PRIu64
+        " raw, %" PRIu64 " intentional, %" PRIu64 " unexpected\n",
+        seq_gaps,
+        intentional_drops,
+        seq_gaps > intentional_drops ? seq_gaps - intentional_drops : 0
     );
 
     fprintf(
@@ -497,6 +505,9 @@ static int v3_write_csv(const char* path)
         "index,"
         "fence_present,"
         "async_commit,"
+        "early_submit,"
+        "overlap_commit,"
+        "intentional_drops_before,"
         "v4l2_ts_ns,"
         "dq_ns,"
         "commit_begin_ns,"
@@ -561,6 +572,9 @@ static int v3_write_csv(const char* path)
             "%u,"
             "%d,"
             "%d,"
+            "%d,"
+            "%d,"
+            "%u,"
             "%" PRIu64 ","
             "%" PRIu64 ","
             "%" PRIu64 ","
@@ -586,6 +600,9 @@ static int v3_write_csv(const char* path)
             x->index,
             x->fence_present,
             x->async_commit,
+            x->early_submit,
+            x->overlap_commit,
+            x->intentional_drops_before,
             x->v4l2_ts_ns,
             x->dq_ns,
             x->commit_begin_ns,
@@ -631,6 +648,7 @@ struct opts {
     bool verbose;
     bool async_flip;
     bool phase_profile;
+    bool early_submit;
     uint32_t target_refresh_millihz;
 
     const char* csv_path;
@@ -1551,6 +1569,7 @@ static void usage(
         "  --async-flip             request DRM_MODE_PAGE_FLIP_ASYNC (experimental)\n"
         "  --phase-profile          record V3.6 CRTC/vblank phase data\n"
         "  --target-refresh-millihz N  V3.7 advertised-mode test (59940)\n"
+        "  --early-submit           V3.8 one-shot overlap/phase-prime experiment\n"
         "  --csv PATH               timing CSV (default /tmp/hdmirx-lowlat.csv)\n"
         "  -v, --verbose            extra per-frame output\n",
 
@@ -1597,6 +1616,9 @@ int main(
             false,
 
         .phase_profile =
+            false,
+
+        .early_submit =
             false,
 
         .target_refresh_millihz =
@@ -1685,6 +1707,13 @@ int main(
                 required_argument,
                 0,
                 11
+            },
+
+            {
+                "early-submit",
+                no_argument,
+                0,
+                12
             },
 
             {
@@ -1802,6 +1831,10 @@ int main(
             }
             break;
 
+        case 12:
+            o.early_submit = true;
+            break;
+
         case 'v':
             o.verbose =
                 true;
@@ -1823,6 +1856,8 @@ int main(
         o.num_buffers > MAX_BUFS ||
         o.seconds < 1 ||
         (o.async_flip && o.phase_profile) ||
+        (o.async_flip && o.early_submit) ||
+        (o.early_submit && !o.phase_profile) ||
         (o.async_flip && o.target_refresh_millihz) ||
         (o.target_refresh_millihz &&
             (o.target_refresh_millihz < 1000U ||
@@ -1836,6 +1871,17 @@ int main(
                 "--phase-profile intentionally measures only the normal "
                 "OUT_FENCE_PTR path; do not combine it with --async-flip.\n"
             );
+        }
+
+        if (o.async_flip && o.early_submit) {
+            fprintf(stderr,
+                "--early-submit uses normal atomic OUT fences and cannot be "
+                "combined with --async-flip.\n");
+        }
+
+        if (o.early_submit && !o.phase_profile) {
+            fprintf(stderr,
+                "--early-submit requires --phase-profile for auditable data.\n");
         }
 
 
@@ -2990,10 +3036,11 @@ int main(
         "No userspace framebuffer copy.\n"
         "V4L2 NV24 DMABUF -> DRM FB "
         "-> atomic KMS plane.\n"
-        "Consolidated V3.7 build: "
-        "V3.4 lifetime, V3.6 phase, and V3.7 cadence instrumentation available.\n"
+        "Consolidated V3.8 build: "
+        "V3.4 lifetime, V3.6 phase, V3.7 cadence, and V3.8 early-submit instrumentation.\n"
         "Atomic commit mode: %s\n"
         "Phase profiler: %s\n"
+        "Early-submit probe: %s\n"
         "Target refresh: %s\n"
         "Timing CSV: %s\n"
         "Auto-stop: %d seconds.\n\n",
@@ -3004,6 +3051,10 @@ int main(
 
         o.phase_profile
         ? "enabled"
+        : "disabled",
+
+        o.early_submit
+        ? "enabled (one controlled overlap attempt)"
         : "disabled",
 
         o.target_refresh_millihz
@@ -3032,6 +3083,14 @@ int main(
     uint64_t frames = 0;
     uint64_t missing_fences = 0;
     uint64_t acquire_waits = 0;
+    uint64_t v38_early_dq_before_out = 0;
+    uint64_t v38_out_before_dq = 0;
+    uint64_t v38_overlap_accepted = 0;
+    uint64_t v38_overlap_ebusy = 0;
+    uint64_t v38_overlap_other_reject = 0;
+    uint64_t v38_intentional_drops = 0;
+    uint32_t v38_drops_pending = 0;
+    bool v38_probe_done = false;
 
     /*
      * IMPORTANT:
@@ -3181,6 +3240,11 @@ int main(
         const uint32_t
             v36_v4l2_flags =
             b.flags;
+
+        const uint32_t v38_drops_before_current =
+            v38_drops_pending;
+
+        v38_drops_pending = 0;
 
 
         if (o.phase_profile && frames == 0) {
@@ -3565,6 +3629,169 @@ int main(
         }
 
 
+        /*
+         * V3.8 controlled overlap probe.
+         *
+         * The normal Rockchip path keeps one atomic update outstanding until
+         * its OUT fence signals.  Once, after warm-up, watch the capture fd
+         * and that OUT fence together.  If a new capture arrives first, issue
+         * a real second nonblocking atomic commit.  Mainline DRM helpers reject
+         * this situation with EBUSY; that is useful evidence, not a failure.
+         * The rejected candidate is waited and returned to HDMI-RX, deliberately
+         * advancing capture phase by one frame without violating ownership.
+         */
+        bool v38_overlap_this_iteration = false;
+        struct v4l2_buffer v38_b;
+        struct v4l2_plane v38_p[VIDEO_MAX_PLANES];
+        int v38_out_fence = -1;
+
+        if (o.early_submit &&
+            !v38_probe_done &&
+            frames >= 120 &&
+            displayed >= 0 &&
+            !async_this_commit &&
+            !modeset_this_commit) {
+
+            struct pollfd pfds[2] = {
+                { .fd = out_fence, .events = POLLIN },
+                { .fd = vfd, .events = POLLIN | POLLPRI },
+            };
+
+            int probe_poll;
+            do {
+                probe_poll = poll(pfds, 2, 1000);
+            } while (probe_poll < 0 && errno == EINTR);
+
+            if (probe_poll < 0) {
+                perror("V3.8 overlap poll");
+                run_failed = true;
+                break;
+            }
+
+            if (probe_poll > 0 &&
+                (pfds[1].revents & (POLLIN | POLLPRI)) &&
+                !(pfds[0].revents & POLLIN)) {
+
+                memset(&v38_b, 0, sizeof(v38_b));
+                memset(v38_p, 0, sizeof(v38_p));
+
+                if (dqbuf_one(vfd, &v38_b, v38_p) < 0) {
+                    perror("V3.8 early VIDIOC_DQBUF");
+                    run_failed = true;
+                    break;
+                }
+
+                if (v38_b.index >= req.count) {
+                    fprintf(stderr, "V3.8 bad early buffer index %u\n", v38_b.index);
+                    run_failed = true;
+                    break;
+                }
+
+                bufs[v38_b.index].queued = false;
+                v38_early_dq_before_out++;
+                v38_probe_done = true;
+
+                int v38_in_fence = extract_fence_fd(&v38_b);
+
+                if (v38_in_fence < 0) {
+                    fprintf(stderr, "V3.8 early buffer had no acquire fence\n");
+                    missing_fences++;
+                    run_failed = true;
+                    break;
+                }
+
+                drmModeAtomicReq* v38_ar = drmModeAtomicAlloc();
+                if (!v38_ar ||
+                    add_plane_props(
+                        drmfd,
+                        v38_ar,
+                        plane->plane_id,
+                        &pp,
+                        crtc_id,
+                        bufs[v38_b.index].fb_id,
+                        w,
+                        h,
+                        v38_in_fence) < 0 ||
+                    drmModeAtomicAddProperty(
+                        v38_ar,
+                        crtc_id,
+                        pp.out_fence_ptr,
+                        (uint64_t)(uintptr_t)&v38_out_fence) < 0) {
+
+                    perror("V3.8 construct overlapping atomic request");
+                    if (v38_ar)
+                        drmModeAtomicFree(v38_ar);
+                    close(v38_in_fence);
+                    run_failed = true;
+                    break;
+                }
+
+                int v38_cr = drmModeAtomicCommit(
+                    drmfd,
+                    v38_ar,
+                    DRM_MODE_ATOMIC_NONBLOCK,
+                    NULL
+                );
+                int v38_saved = errno;
+
+                drmModeAtomicFree(v38_ar);
+                errno = v38_saved;
+
+                if (v38_cr == 0) {
+                    close(v38_in_fence);
+                    v38_overlap_accepted++;
+                    v38_overlap_this_iteration = true;
+                    fprintf(stderr,
+                        "V3.8: overlapping nonblocking atomic commit accepted.\n");
+                }
+                else {
+                    if (errno == EBUSY) {
+                        v38_overlap_ebusy++;
+                        fprintf(stderr,
+                            "V3.8: overlap rejected with EBUSY; phase-prime drop follows.\n");
+                    }
+                    else {
+                        v38_overlap_other_reject++;
+                        fprintf(stderr,
+                            "V3.8: overlap rejected with errno=%d (%s); "
+                            "phase-prime drop follows.\n",
+                            errno,
+                            strerror(errno));
+                    }
+
+                    if (v38_out_fence >= 0) {
+                        close(v38_out_fence);
+                        v38_out_fence = -1;
+                    }
+
+                    /* The failed atomic commit did not consume the producer. */
+                    if (v38_in_fence >= 0) {
+                        if (wait_fd(v38_in_fence, 1000) < 0) {
+                            perror("V3.8 wait rejected candidate acquire fence");
+                            close(v38_in_fence);
+                            run_failed = true;
+                            break;
+                        }
+                        close(v38_in_fence);
+                    }
+
+                    if (qbuf_one(vfd, v38_b.index) < 0) {
+                        perror("V3.8 QBUF rejected candidate");
+                        run_failed = true;
+                        break;
+                    }
+
+                    bufs[v38_b.index].queued = true;
+                    v38_intentional_drops++;
+                    v38_drops_pending++;
+                }
+            }
+            else if (probe_poll > 0 && (pfds[0].revents & POLLIN)) {
+                v38_out_before_dq++;
+            }
+        }
+
+
         uint64_t v3_out_signal_ns;
 
 
@@ -3648,6 +3875,15 @@ int main(
 
             vs->async_commit =
                 async_this_commit;
+
+            vs->early_submit =
+                o.early_submit;
+
+            vs->overlap_commit =
+                false;
+
+            vs->intentional_drops_before =
+                v38_drops_before_current;
 
             vs->v4l2_ts_ns =
                 v3_v4l2_ts_ns;
@@ -3737,6 +3973,35 @@ int main(
             b.index;
 
 
+        if (v38_overlap_this_iteration) {
+            if (v38_out_fence < 0 || wait_fd(v38_out_fence, 1000) < 0) {
+                perror("V3.8 wait accepted overlap OUT fence");
+                if (v38_out_fence >= 0)
+                    close(v38_out_fence);
+                run_failed = true;
+                break;
+            }
+
+            close(v38_out_fence);
+
+            /* The accepted second commit replaced b; it is now safe to reuse. */
+            if (!bufs[b.index].queued) {
+                if (qbuf_one(vfd, b.index) < 0) {
+                    perror("V3.8 QBUF superseded current buffer");
+                    run_failed = true;
+                    break;
+                }
+                v34_mark_qbuf(b.index, v3_mono_ns());
+                bufs[b.index].queued = true;
+            }
+
+            displayed = v38_b.index;
+            fprintf(stderr,
+                "V3.8: accepted-overlap capability proven; stopping safely.\n");
+            g_stop = 1;
+        }
+
+
         frames++;
 
 
@@ -3797,6 +4062,12 @@ int main(
         "missing Rockchip fences:     %" PRIu64 "\n"
         "userspace acquire waits:     %" PRIu64 " (%s)\n"
         "phase profiler samples:      %zu (%s)\n"
+        "V3.8 early DQ before OUT:     %" PRIu64 "\n"
+        "V3.8 OUT before/equal DQ:     %" PRIu64 "\n"
+        "V3.8 overlap accepted:        %" PRIu64 "\n"
+        "V3.8 overlap EBUSY:           %" PRIu64 "\n"
+        "V3.8 other overlap rejects:   %" PRIu64 "\n"
+        "V3.8 intentional drops:       %" PRIu64 "\n"
         "last displayed capture buf: %d\n"
         "runtime status:              %s\n",
 
@@ -3813,12 +4084,32 @@ int main(
         ? "enabled"
         : "disabled",
 
+        v38_early_dq_before_out,
+        v38_out_before_dq,
+        v38_overlap_accepted,
+        v38_overlap_ebusy,
+        v38_overlap_other_reject,
+        v38_intentional_drops,
+
         displayed,
 
         run_failed
         ? "FAILED"
         : "completed"
     );
+
+    if (o.early_submit) {
+        const char* outcome =
+            v38_overlap_accepted
+            ? "overlap accepted; capability proven"
+            : (v38_overlap_ebusy
+                ? "overlap rejected with EBUSY; phase-prime completed"
+                : (v38_early_dq_before_out
+                    ? "overlap rejected with a non-EBUSY error"
+                    : "no capture-ready-before-OUT window observed"));
+
+        fprintf(stderr, "V3.8 probe outcome:          %s\n", outcome);
+    }
 
 
     if (xioctl(

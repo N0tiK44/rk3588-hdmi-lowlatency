@@ -28,7 +28,8 @@ The active path has **no GStreamer, no CPU colour conversion, no framebuffer cop
 - stable capture pool: **4 buffers minimum** at the characterized ~60 Hz mode
 - V3.5 result: **atomic async rejected as unsupported by the Rockchip 6.1 driver**
 - V3.6 result: **59.94 Hz input against exact 60.000 Hz output caused eight periodic two-vblank waits**
-- current experiment: **V3.7 EDID-advertised 59.94 Hz cadence-alignment A/B test**
+- V3.7 result: **EDID-advertised 59.940 Hz output removes the practical 59.94/60.00 cadence beat**
+- current experiment: **V3.8 controlled early-submission/phase-prime A/B test**
 - current workflow: **one Pi command updates, builds, runs and packages results**
 - long-term target: **1080p240**
 
@@ -71,7 +72,7 @@ make
 After the repository has been cloned once, the routine Orange Pi workflow is:
 
 ```bash
-bash ~/src/rk3588-hdmi-lowlatency/scripts/pi-debug.sh v37
+bash ~/src/rk3588-hdmi-lowlatency/scripts/pi-debug.sh v38
 ```
 
 Run it as the normal login user, without a leading `sudo`. It safely
@@ -152,6 +153,31 @@ the two-minute arms. The calculated cadence-slip interval increased from
 `16.544 s` to `1,354.377 s` (about 22.6 minutes). The normal one-vblank wait
 remained, as expected.
 
+## V3.8 early-submission probe
+
+```bash
+bash ~/src/rk3588-hdmi-lowlatency/scripts/pi-debug.sh v38
+```
+
+V3.8 runs two 120-second arms at the verified EDID-advertised 59.940 Hz mode.
+The first is an unchanged reference. After warm-up in the second arm, the
+program watches capture readiness and the outstanding KMS `OUT_FENCE_PTR`
+together. If the next capture buffer becomes ready first, it makes one real
+overlapping `DRM_MODE_ATOMIC_NONBLOCK` commit.
+
+An `EBUSY` rejection is the expected Linux 6.1 Rockchip capability result. The
+candidate acquire fence is then waited and the candidate is returned to
+HDMI-RX as one explicitly annotated phase-prime drop. Unexpected sequence gaps
+remain failures; the one intentional gap is separated in the CSV and analyzer.
+If a vendor kernel accepts the overlap, both output fences are honored and the
+run stops safely after proving the capability. The test never copies or
+converts pixels and retains four-buffer ownership discipline.
+
+The approximately 16 ms offset observed between the host PC's dGPU-driven MSI
+display and iGPU-driven ZOWIE input is a provisional control-path assumption,
+not a measured Orange Pi latency. Repeat the camera control with both outputs
+on the same GPU before subtracting it from glass-to-glass results.
+
 ## Analyze an existing trace
 
 ```bash
@@ -219,6 +245,7 @@ When an experiment is proven, merge it to `main` and create a new annotated tag 
 - `docs/VERSIONING.md` — rollback-safe tags and experiment branches
 - `docs/V36_RUNBOOK.md` — GitHub upload, Pi update, build and verification commands
 - `docs/V37_RUNBOOK.md` — V3.7 update, A/B run and recovery procedure
+- `docs/V38_RUNBOOK.md` — V3.8 automated run, result counters and interpretation
 - `docs/AUTOMATION.md` — one-command Pi run and one-command Windows retrieval
 - `docs/results/v3.3-buffer-sweep.md` — buffer-count conclusion
 - `docs/results/v3.4-buffer-lifetime.md` — measured phase/ownership result

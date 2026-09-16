@@ -101,6 +101,20 @@ These extra ioctls are diagnostic overhead and V3.6 does not claim they reduce l
 
 V3.7 optionally selects a 1920×1080 connector mode within 0.005 Hz of the requested millihertz value. The candidate must come directly from the connector's EDID mode list. The program creates atomic mode blobs, includes connector `CRTC_ID` plus CRTC `MODE_ID`/`ACTIVE` in the first normal NV24 commit, and uses `DRM_MODE_ATOMIC_ALLOW_MODESET`.
 
+## V3.8 controlled overlap and phase-prime
+
+After warm-up, V3.8 polls the current KMS output fence and HDMI-RX capture fd
+together. A capture-ready-first result triggers exactly one second
+`DRM_MODE_ATOMIC_NONBLOCK` request while the preceding update is pending. The
+new request has its own `IN_FENCE_FD` and `OUT_FENCE_PTR`.
+
+If the kernel rejects it, the program retains ownership of the candidate,
+waits its producer fence, closes that fence, and only then QBUFs it. This single
+intentional capture drop is annotated on the next CSV sample. If the overlap is
+accepted, both display fences are waited in submission order before the
+superseded capture buffer is returned. Thus neither result requeues a buffer
+while capture or scanout may still own it.
+
 The capture format, plane, DMA-BUF objects, acquire fences, output fences and four-buffer ownership rule remain unchanged. When the selected timing differs from the startup timing, cleanup disables the experiment plane and atomically restores the original CRTC mode before framebuffer removal. Failure to find, apply or restore the advertised mode is a failed experiment; there is no synthetic-timing fallback.
 
 ## V3.5 async experiment
