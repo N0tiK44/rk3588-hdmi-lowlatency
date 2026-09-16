@@ -1,5 +1,23 @@
 # V3.7 GitHub and Orange Pi runbook
 
+## Recommended automated path
+
+After publishing the repository update, the normal Pi-side procedure is now a
+single command:
+
+```bash
+bash ~/src/rk3588-hdmi-lowlatency/scripts/pi-debug.sh v37
+```
+
+It performs the update, build, A/B run and archive creation below. Retrieve the
+result on Windows with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\fetch-latest.ps1
+```
+
+The remaining sections document the equivalent manual/recovery procedure.
+
 ## Publish
 
 Extract the V3.7 ZIP, upload the contents inside its top-level directory to the GitHub `main` branch, and commit as `Release V3.7 cadence alignment`. Update `.gitignore` through GitHub's pencil editor if the browser hides dotfiles. Do not upload the ZIP itself or create a nested repository directory.

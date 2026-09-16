@@ -1,5 +1,17 @@
 # Development history
 
+## V3.7.1 — reproducible one-command workflow
+
+Added a guarded Pi bootstrap that fast-forwards `main`, validates/builds the
+source, runs a selected experiment and always packages machine-readable results.
+Added a PowerShell fetch helper with a stable `latest.tar.gz` remote path. This
+is a workflow release only; the V3.7 datapath is unchanged.
+
+The V3.7 hardware result was also recorded: matching the advertised 59.940 Hz
+mode reduced the observed two-vblank cadence slips from seven to one and
+extended the theoretical beat period from 16.544 seconds to 1,354.377 seconds,
+with no capture gaps or missing fences.
+
 This repository was reconstructed from the historical project packages and intentionally replaces the old patch-chain layout with one current source file.
 
 | Version | Purpose | Consolidated conclusion |
