@@ -17,7 +17,7 @@ If async is rejected by the driver, record that as the V3.5 result and move on; 
 
 Hardware result: Linux 6.1.115-vendor-rk35xx did not advertise atomic async page flips and rejected the diagnostic atomic async commit with `EINVAL`. The normal trace remained healthy. This is an unsupported-feature result, not a regression.
 
-## V3.6 — current: phase profiler
+## V3.6 — completed: phase profiler
 
 V3.6 measures before changing timing:
 
@@ -30,6 +30,14 @@ V3.6 measures before changing timing:
 - distinguish unavoidable scanout time from avoidable one-period waits.
 
 Refresh-offset experiments belong in V3.7 only after V3.6 establishes the direction and rate of drift.
+
+Hardware result: the 59.94 Hz HDMI-RX stream ran against an exact 60.000 Hz CRTC. Eight frames took two vblank intervals, spaced approximately 980 frames apart, while capture sequence and fence integrity remained perfect.
+
+## V3.7 — current: advertised 59.94 Hz alignment
+
+Run a controlled A/B comparison between the existing active timing and an EDID-advertised 59.94 Hz output mode. The test must restore the original mode, retain the normal explicit-sync path, and refuse synthetic timings.
+
+Primary success criterion: eliminate or materially reduce the periodic two-vblank events. The normal one-vblank completion delay is expected to remain and will be addressed separately after cadence stability is proven.
 
 ## High-refresh validation
 

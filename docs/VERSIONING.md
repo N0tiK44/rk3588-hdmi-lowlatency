@@ -60,4 +60,11 @@ git switch -c experiment/v3.7-refresh-offset v3.6-phase-profiler
 
 Do not create the V3.6 tag before the Orange Pi run passes; tags identify hardware-verified states, not merely uploaded code.
 
+V3.7 changes output timing temporarily, so retain `v3.6-phase-profiler` as the immediate rollback point. After the A/B runner completes, verify the original mode-restoration message before tagging:
+
+```bash
+git tag -a v3.7-cadence-alignment -m "Hardware-verified V3.7 cadence result"
+git push origin v3.7-cadence-alignment
+```
+
 Avoid using patch-application scripts, force-pushes, or untagged “known good” states as the rollback mechanism.

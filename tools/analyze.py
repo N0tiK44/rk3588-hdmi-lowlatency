@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze RK3588 HDMI-RX/KMS V3.4-V3.6 timing CSV traces."""
+"""Analyze RK3588 HDMI-RX/KMS V3.4-V3.7 timing CSV traces."""
 from __future__ import annotations
 
 import csv
@@ -83,9 +83,9 @@ def analyze(path):
     seq_gaps = missing_fences = phase_rows = monotonic_rows = soe_rows = 0
     per_index_last_dq = {}
     per_index_reuse = defaultdict(list)
-    drift_points = []
-    last_phase_ns = None
-    unwrapped_phase_ns = 0
+    cadence_wrap_frames = []
+    two_vblank_frames = []
+    previous_vts_to_dq = None
     prev = None
 
     for row in rows:
@@ -132,7 +132,11 @@ def analyze(path):
         if integer(row.get("phase_valid")) == 1 and period and None not in phase_values:
             phase_rows += 1
             dq_seq, dq_vb, commit_seq, commit_vb, out_seq, out_vb = phase_values
-            if flags is not None and (flags & V4L2_TS_MASK) == V4L2_TS_MONOTONIC:
+            row_monotonic = (
+                flags is not None and
+                (flags & V4L2_TS_MASK) == V4L2_TS_MONOTONIC
+            )
+            if row_monotonic:
                 monotonic_rows += 1
                 val = delta_us(vts, dq)
                 if val is not None:
@@ -149,35 +153,54 @@ def analyze(path):
                 if val is not None:
                     metrics[key].append(val)
             metrics["dq_to_commit_vblank_advance"].append(commit_seq - dq_seq)
-            metrics["commit_to_out_vblank_advance"].append(out_seq - commit_seq)
-            current_phase_ns = (dq - dq_vb) % period
-            if last_phase_ns is not None:
-                step = current_phase_ns - last_phase_ns
-                if step > period / 2:
-                    step -= period
-                elif step < -period / 2:
-                    step += period
-                unwrapped_phase_ns += step
-            last_phase_ns = current_phase_ns
-            drift_points.append((dq, unwrapped_phase_ns))
+            out_steps = out_seq - commit_seq
+            metrics["commit_to_out_vblank_advance"].append(out_steps)
+            metrics["mode_period_ns"].append(period)
+            if out_steps > 1:
+                two_vblank_frames.append(integer(row.get("frame")))
+            if row_monotonic and metrics["v4l2_timestamp_to_dq"]:
+                current_vts_to_dq = metrics["v4l2_timestamp_to_dq"][-1]
+                if (previous_vts_to_dq is not None and
+                    current_vts_to_dq - previous_vts_to_dq > period / 2000.0):
+                    cadence_wrap_frames.append(integer(row.get("frame")))
+                previous_vts_to_dq = current_vts_to_dq
         prev = {"seq": seq, "dq": dq, "out": out, "vts": vts}
 
     if not metrics["commit_to_out"]:
         raise RuntimeError(f"{path}: no usable timing rows")
-    drift_us = drift_ppm = math.nan
-    if len(drift_points) >= 2:
-        elapsed = drift_points[-1][0] - drift_points[0][0]
-        drift = drift_points[-1][1] - drift_points[0][1]
-        drift_us = drift / 1000.0
-        if elapsed > 0:
-            drift_ppm = drift / elapsed * 1_000_000.0
+    v4l2_timestamps = [
+        integer(row.get("v4l2_ts_ns")) for row in rows
+        if integer(row.get("v4l2_ts_ns")) is not None
+    ]
+    input_period_us = (
+        (v4l2_timestamps[-1] - v4l2_timestamps[0]) /
+        (len(v4l2_timestamps) - 1) / 1000.0
+        if len(v4l2_timestamps) >= 2 else math.nan
+    )
+    mode_period_ns = median(metrics["mode_period_ns"])
+    input_hz = 1_000_000.0 / input_period_us if input_period_us else math.nan
+    output_hz = 1_000_000_000.0 / mode_period_ns if mode_period_ns else math.nan
+    cadence_delta_hz = abs(output_hz - input_hz)
+    slip_seconds = (
+        1.0 / cadence_delta_hz
+        if not math.isnan(cadence_delta_hz) and cadence_delta_hz >= 1e-9
+        else math.inf
+    )
+    two_vblank_spacings = [
+        b - a for a, b in zip(two_vblank_frames, two_vblank_frames[1:])
+        if a is not None and b is not None
+    ]
     return {
         "path": str(path), "rows": len(rows), "sync_rows": sync_rows,
         "async_rows": async_rows, "seq_gaps": seq_gaps,
         "missing_fences": missing_fences, "metrics": metrics,
         "per_index_reuse": per_index_reuse, "phase_rows": phase_rows,
         "monotonic_rows": monotonic_rows, "soe_rows": soe_rows,
-        "phase_drift_us": drift_us, "phase_drift_ppm": drift_ppm,
+        "input_hz": input_hz, "output_hz": output_hz,
+        "slip_seconds": slip_seconds,
+        "two_vblank_frames": two_vblank_frames,
+        "two_vblank_spacings": two_vblank_spacings,
+        "cadence_wrap_frames": cadence_wrap_frames,
     }
 
 
@@ -224,8 +247,19 @@ def show(label, result):
             print(metric_line(title, m[key]))
         print(metric_line("DQ -> commit vblank steps", m["dq_to_commit_vblank_advance"], "count"))
         print(metric_line("commit -> OUT vblank steps", m["commit_to_out_vblank_advance"], "count"))
-        if not math.isnan(result["phase_drift_us"]):
-            print(f"  unwrapped DQ/display drift:   {result['phase_drift_us'] / 1000.0:+.3f} ms ({result['phase_drift_ppm']:+.3f} ppm across trace)")
+        print("\n  V3.7 cadence diagnosis:")
+        print(f"  measured input cadence:      {result['input_hz']:.6f} Hz")
+        print(f"  active output cadence:       {result['output_hz']:.6f} Hz")
+        beat = (
+            f"{result['slip_seconds']:.3f} seconds"
+            if math.isfinite(result["slip_seconds"])
+            else "matched within measurement precision"
+        )
+        print(f"  theoretical beat period:    {beat}")
+        print(f"  timestamp sawtooth wraps:    {len(result['cadence_wrap_frames'])}")
+        print(f"  two-vblank completions:      {len(result['two_vblank_frames'])} / {result['phase_rows']}")
+        if result["two_vblank_spacings"]:
+            print(f"  two-vblank spacing p50:      {median(result['two_vblank_spacings']):.1f} frames")
 
 
 def main(argv):
@@ -233,13 +267,19 @@ def main(argv):
         raise SystemExit("usage: analyze.py TRACE.csv [ASYNC.csv]")
     normal = analyze(argv[1])
     print("=== RK3588 HDMI-RX / KMS TIMING REPORT ===")
-    show("NORMAL" if len(argv) == 3 else "TRACE", normal)
+    show("REFERENCE" if len(argv) == 3 else "TRACE", normal)
     if len(argv) == 3:
-        async_result = analyze(argv[2])
+        comparison = analyze(argv[2])
         print()
-        show("ASYNC", async_result)
-        gain = median(normal["metrics"]["commit_to_out"]) - median(async_result["metrics"]["commit_to_out"])
-        print(f"\nAsync completion median improvement: {gain / 1000.0:.3f} ms")
+        is_async = comparison["async_rows"] > 0
+        show("ASYNC" if is_async else "ALIGNED", comparison)
+        gain = median(normal["metrics"]["commit_to_out"]) - median(comparison["metrics"]["commit_to_out"])
+        print(f"\nCompletion median improvement: {gain / 1000.0:.3f} ms")
+        print(
+            "Two-vblank completions: "
+            f"{len(normal['two_vblank_frames'])} -> "
+            f"{len(comparison['two_vblank_frames'])}"
+        )
 
 
 if __name__ == "__main__":

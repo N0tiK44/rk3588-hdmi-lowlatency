@@ -13,13 +13,14 @@ This repository was reconstructed from the historical project packages and inten
 | V3.3.1 | CSV-analysis repair | Added compatibility for malformed historical CSV newline formatting. |
 | V3.4 | Buffer-lifetime instrumentation | Added `qbuf_ns`; isolated display phase and ownership as the dominant delay. |
 | V3.5 | Async phase experiment | Linux 6.1 Rockchip/VOP2 rejected the atomic async commit; normal baseline remained valid. |
-| V3.6 | Phase profiler | Adds CRTC sequence/timestamp correlation and V4L2 timestamp diagnostics without changing the proven datapath. Current stage. |
+| V3.6 | Phase profiler | Found 59.94/60.000 Hz cadence wraps: eight two-vblank completions in 7,126 post-warmup frames with no capture gaps. |
+| V3.7 | Cadence alignment | A/B tests unchanged timing against an EDID-advertised 59.94 Hz mode and restores the original mode. Current stage. |
 
 ## Consolidation decisions
 
 ### One C source, no patch chain
 
-The current `src/hdmirx-kms-lowlat.c` is based on the proven V2 direct path with the V3.1 measurement instrumentation, V3.4 QBUF lifetime timestamping, V3.5 async diagnostic and V3.6 phase profiler integrated directly. Historical `apply-v3*.py` scripts are not required and are not shipped.
+The current `src/hdmirx-kms-lowlat.c` is based on the proven V2 direct path with the V3.1 measurement instrumentation, V3.4 QBUF lifetime timestamping, V3.5 async diagnostic, V3.6 phase profiler and V3.7 advertised-mode experiment integrated directly. Historical `apply-v3*.py` scripts are not required and are not shipped.
 
 ### V3.5 historical patcher mismatch
 

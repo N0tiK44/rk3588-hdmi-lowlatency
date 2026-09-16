@@ -18,7 +18,7 @@ $(TARGET): $(SRC)
 check:
 	$(CC) $(CPPFLAGS) $(CFLAGS) -fsyntax-only $(SRC)
 	python3 -m py_compile tools/analyze.py
-	bash -n scripts/run-baseline.sh scripts/run-v35-phase.sh scripts/run-v36-phase-profiler.sh
+	bash -n scripts/run-baseline.sh scripts/run-v35-phase.sh scripts/run-v36-phase-profiler.sh scripts/run-v37-cadence-alignment.sh
 
 clean:
 	rm -f $(TARGET)

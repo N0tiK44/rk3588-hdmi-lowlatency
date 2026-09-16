@@ -95,7 +95,13 @@ Early V3 measurement packages could emit literal `\\n` sequences into CSV output
 
 With `--phase-profile`, the normal atomic path also samples `drmCrtcGetSequence()` immediately after DQ, immediately before commit, and after output-fence completion. The raw CRTC sequence/timestamp values, active mode period, and V4L2 buffer timestamp flags are written to the CSV. DRM monotonic vblank timestamps are required so all events share the `CLOCK_MONOTONIC` domain.
 
-These extra ioctls are diagnostic overhead and V3.6 does not claim they reduce latency. The analyzer uses them to estimate each event's phase after the most recent vblank, time until the predicted next vblank, vblank sequence advances, and unwrapped capture/display phase drift.
+These extra ioctls are diagnostic overhead and V3.6 does not claim they reduce latency. The analyzer uses them to estimate each event's phase after the most recent vblank, time until the predicted next vblank, vblank sequence advances, timestamp sawtooth wraps and multi-vblank completions.
+
+## V3.7 temporary advertised-mode change
+
+V3.7 optionally selects a 1920×1080 connector mode within 0.005 Hz of the requested millihertz value. The candidate must come directly from the connector's EDID mode list. The program creates atomic mode blobs, includes connector `CRTC_ID` plus CRTC `MODE_ID`/`ACTIVE` in the first normal NV24 commit, and uses `DRM_MODE_ATOMIC_ALLOW_MODESET`.
+
+The capture format, plane, DMA-BUF objects, acquire fences, output fences and four-buffer ownership rule remain unchanged. When the selected timing differs from the startup timing, cleanup disables the experiment plane and atomically restores the original CRTC mode before framebuffer removal. Failure to find, apply or restore the advertised mode is a failed experiment; there is no synthetic-timing fallback.
 
 ## V3.5 async experiment
 

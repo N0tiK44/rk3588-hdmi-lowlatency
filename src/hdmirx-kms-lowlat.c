@@ -40,13 +40,14 @@
 #define MAX_SAMPLES 65536
 
 /*
- * CONSOLIDATED V3.6 PHASE-PROFILER BUILD
+ * CONSOLIDATED V3.7 CADENCE-ALIGNMENT BUILD
  *
  * Working V2 zero-copy path
  * + V3 measurement instrumentation
  * + V3.4 buffer-lifetime instrumentation
  * + V3.5 async page-flip A/B experiment
  * + V3.6 CRTC/vblank phase instrumentation
+ * + V3.7 advertised-mode 59.94 Hz alignment experiment
  *
  * Current proven architecture:
  *
@@ -168,6 +169,94 @@ static uint64_t v36_mode_period_ns(const drmModeModeInfo* mode)
         denominator * 1000000000ULL +
         numerator_hz / 2ULL
     ) / numerator_hz;
+}
+
+
+static uint32_t mode_refresh_millihz(const drmModeModeInfo* mode)
+{
+    uint64_t period_ns = v36_mode_period_ns(mode);
+
+    if (!period_ns)
+        return 0;
+
+    return (uint32_t)(
+        (1000000000000ULL + period_ns / 2ULL) /
+        period_ns
+    );
+}
+
+
+static const drmModeModeInfo* pick_refresh_mode(
+    const drmModeConnector* conn,
+    uint32_t width,
+    uint32_t height,
+    uint32_t target_millihz
+)
+{
+    const drmModeModeInfo* best = NULL;
+    uint32_t best_delta = UINT32_MAX;
+
+    fprintf(
+        stderr,
+        "Advertised %ux%u modes for V3.7:\n",
+        width,
+        height
+    );
+
+    for (int i = 0; i < conn->count_modes; i++) {
+        const drmModeModeInfo* mode = &conn->modes[i];
+
+        if (mode->hdisplay != width || mode->vdisplay != height)
+            continue;
+
+        uint32_t refresh = mode_refresh_millihz(mode);
+
+        fprintf(
+            stderr,
+            "  [%d] %s clock=%u kHz htotal=%u vtotal=%u "
+            "refresh=%u.%03u Hz%s\n",
+            i,
+            mode->name,
+            mode->clock,
+            mode->htotal,
+            mode->vtotal,
+            refresh / 1000U,
+            refresh % 1000U,
+            mode->type & DRM_MODE_TYPE_PREFERRED ? " preferred" : ""
+        );
+
+        uint32_t delta =
+            refresh > target_millihz
+            ? refresh - target_millihz
+            : target_millihz - refresh;
+
+        if (delta < best_delta) {
+            best = mode;
+            best_delta = delta;
+        }
+    }
+
+    /* Do not silently substitute 60.000 Hz for a requested 59.940 Hz. */
+    return best_delta <= 5U ? best : NULL;
+}
+
+
+static bool same_mode_timing(
+    const drmModeModeInfo* a,
+    const drmModeModeInfo* b
+)
+{
+    return a->clock == b->clock &&
+        a->hdisplay == b->hdisplay &&
+        a->hsync_start == b->hsync_start &&
+        a->hsync_end == b->hsync_end &&
+        a->htotal == b->htotal &&
+        a->vdisplay == b->vdisplay &&
+        a->vsync_start == b->vsync_start &&
+        a->vsync_end == b->vsync_end &&
+        a->vtotal == b->vtotal &&
+        a->vscan == b->vscan &&
+        a->flags == b->flags;
 }
 
 
@@ -542,6 +631,7 @@ struct opts {
     bool verbose;
     bool async_flip;
     bool phase_profile;
+    uint32_t target_refresh_millihz;
 
     const char* csv_path;
 };
@@ -573,6 +663,13 @@ struct drm_props {
 
     uint32_t in_fence_fd;
     uint32_t out_fence_ptr;
+};
+
+
+struct mode_props {
+    uint32_t connector_crtc_id;
+    uint32_t crtc_mode_id;
+    uint32_t crtc_active;
 };
 
 
@@ -1392,6 +1489,46 @@ static int add_async_plane_props(
 }
 
 
+static int add_modeset_props(
+    drmModeAtomicReq* req,
+    uint32_t connector_id,
+    uint32_t crtc_id,
+    const struct mode_props* mp,
+    uint32_t mode_blob_id
+)
+{
+    if (!mp->connector_crtc_id ||
+        !mp->crtc_mode_id ||
+        !mp->crtc_active ||
+        !mode_blob_id) {
+
+        errno = ENOENT;
+        return -1;
+    }
+
+    if (drmModeAtomicAddProperty(
+            req,
+            connector_id,
+            mp->connector_crtc_id,
+            crtc_id) < 0 ||
+        drmModeAtomicAddProperty(
+            req,
+            crtc_id,
+            mp->crtc_mode_id,
+            mode_blob_id) < 0 ||
+        drmModeAtomicAddProperty(
+            req,
+            crtc_id,
+            mp->crtc_active,
+            1) < 0) {
+
+        return -1;
+    }
+
+    return 0;
+}
+
+
 /* ------------------------------------------------------------------------- */
 /* CLI                                                                       */
 /* ------------------------------------------------------------------------- */
@@ -1413,6 +1550,7 @@ static void usage(
         "  --no-low-latency         do not toggle rockchip_hdmirx low_latency\n"
         "  --async-flip             request DRM_MODE_PAGE_FLIP_ASYNC (experimental)\n"
         "  --phase-profile          record V3.6 CRTC/vblank phase data\n"
+        "  --target-refresh-millihz N  V3.7 advertised-mode test (59940)\n"
         "  --csv PATH               timing CSV (default /tmp/hdmirx-lowlat.csv)\n"
         "  -v, --verbose            extra per-frame output\n",
 
@@ -1460,6 +1598,9 @@ int main(
 
         .phase_profile =
             false,
+
+        .target_refresh_millihz =
+            0,
 
         .csv_path =
             "/tmp/hdmirx-lowlat.csv",
@@ -1537,6 +1678,13 @@ int main(
                 no_argument,
                 0,
                 10
+            },
+
+            {
+                "target-refresh-millihz",
+                required_argument,
+                0,
+                11
             },
 
             {
@@ -1644,6 +1792,16 @@ int main(
                 true;
             break;
 
+        case 11:
+            if (parse_u32_arg(
+                optarg,
+                &o.target_refresh_millihz) < 0) {
+
+                fprintf(stderr, "Invalid target refresh: %s\n", optarg);
+                return 2;
+            }
+            break;
+
         case 'v':
             o.verbose =
                 true;
@@ -1664,7 +1822,11 @@ int main(
         o.num_buffers < 3 ||
         o.num_buffers > MAX_BUFS ||
         o.seconds < 1 ||
-        (o.async_flip && o.phase_profile)) {
+        (o.async_flip && o.phase_profile) ||
+        (o.async_flip && o.target_refresh_millihz) ||
+        (o.target_refresh_millihz &&
+            (o.target_refresh_millihz < 1000U ||
+             o.target_refresh_millihz > 1000000U))) {
 
         usage(argv[0]);
 
@@ -1673,6 +1835,15 @@ int main(
                 stderr,
                 "--phase-profile intentionally measures only the normal "
                 "OUT_FENCE_PTR path; do not combine it with --async-flip.\n"
+            );
+        }
+
+
+        if (o.async_flip && o.target_refresh_millihz) {
+            fprintf(
+                stderr,
+                "V3.7 cadence alignment uses the normal OUT_FENCE_PTR "
+                "path and cannot be combined with --async-flip.\n"
             );
         }
 
@@ -1772,6 +1943,16 @@ int main(
     drmModeConnector* conn = NULL;
     drmModeCrtc* crtc = NULL;
     drmModePlane* plane = NULL;
+    uint32_t crtc_id = 0;
+    uint32_t target_mode_blob = 0;
+    uint32_t original_mode_blob = 0;
+    bool target_mode_applied = false;
+    bool target_mode_verified = false;
+    bool mode_changed = false;
+    drmModeModeInfo target_mode;
+    memset(&target_mode, 0, sizeof(target_mode));
+    struct mode_props mp;
+    memset(&mp, 0, sizeof(mp));
 
 
     struct cap_buf bufs[MAX_BUFS];
@@ -2111,7 +2292,7 @@ int main(
     );
 
 
-    uint32_t crtc_id =
+    crtc_id =
         pick_crtc_for_connector(
             drmfd,
             res,
@@ -2169,8 +2350,8 @@ int main(
             stderr,
             "The selected CRTC is not "
             "already active.\n"
-            "This safety-first build "
-            "does not modeset.\n"
+            "V3.7 only changes timing from an already-active, "
+            "matching-resolution mode.\n"
             "Boot/leave the display at "
             "1920x1080 first, then retry.\n"
         );
@@ -2188,8 +2369,97 @@ int main(
     );
 
 
+    if (o.target_refresh_millihz) {
+        const drmModeModeInfo* selected =
+            pick_refresh_mode(
+                conn,
+                w,
+                h,
+                o.target_refresh_millihz
+            );
+
+        if (!selected) {
+            fprintf(
+                stderr,
+                "No EDID-advertised %ux%u mode within 0.005 Hz of "
+                "%u.%03u Hz. V3.7 refuses to synthesize an unadvertised "
+                "timing.\n",
+                w,
+                h,
+                o.target_refresh_millihz / 1000U,
+                o.target_refresh_millihz % 1000U
+            );
+
+            goto out;
+        }
+
+        target_mode = *selected;
+        mode_changed = !same_mode_timing(&crtc->mode, &target_mode);
+
+        mp.connector_crtc_id = prop_id(
+            drmfd,
+            conn->connector_id,
+            DRM_MODE_OBJECT_CONNECTOR,
+            "CRTC_ID"
+        );
+        mp.crtc_mode_id = prop_id(
+            drmfd,
+            crtc_id,
+            DRM_MODE_OBJECT_CRTC,
+            "MODE_ID"
+        );
+        mp.crtc_active = prop_id(
+            drmfd,
+            crtc_id,
+            DRM_MODE_OBJECT_CRTC,
+            "ACTIVE"
+        );
+
+        if (!mp.connector_crtc_id || !mp.crtc_mode_id || !mp.crtc_active) {
+            fprintf(stderr, "V3.7 modeset properties are unavailable.\n");
+            goto out;
+        }
+
+        if (drmModeCreatePropertyBlob(
+                drmfd,
+                &target_mode,
+                sizeof(target_mode),
+                &target_mode_blob) < 0) {
+
+            perror("create V3.7 target mode blob");
+            goto out;
+        }
+
+        if (mode_changed &&
+            drmModeCreatePropertyBlob(
+                drmfd,
+                &crtc->mode,
+                sizeof(crtc->mode),
+                &original_mode_blob) < 0) {
+
+            perror("create original mode blob");
+            goto out;
+        }
+
+        fprintf(
+            stderr,
+            "V3.7 target mode: %s clock=%u kHz refresh=%u.%03u Hz "
+            "(%s)\n",
+            target_mode.name,
+            target_mode.clock,
+            mode_refresh_millihz(&target_mode) / 1000U,
+            mode_refresh_millihz(&target_mode) % 1000U,
+            mode_changed ? "temporary modeset" : "already active"
+        );
+    }
+
+
     uint64_t phase_mode_period_ns =
-        v36_mode_period_ns(&crtc->mode);
+        v36_mode_period_ns(
+            o.target_refresh_millihz
+            ? &target_mode
+            : &crtc->mode
+        );
 
     if (o.phase_profile) {
         if (!phase_mode_period_ns) {
@@ -2203,13 +2473,13 @@ int main(
 
         fprintf(
             stderr,
-            "V3.6 active mode: %s clock=%u kHz htotal=%u "
+            "Measurement mode: %s clock=%u kHz htotal=%u "
             "vtotal=%u vscan=%u period=%.6f ms refresh=%.6f Hz\n",
-            crtc->mode.name,
-            crtc->mode.clock,
-            crtc->mode.htotal,
-            crtc->mode.vtotal,
-            crtc->mode.vscan,
+            o.target_refresh_millihz ? target_mode.name : crtc->mode.name,
+            o.target_refresh_millihz ? target_mode.clock : crtc->mode.clock,
+            o.target_refresh_millihz ? target_mode.htotal : crtc->mode.htotal,
+            o.target_refresh_millihz ? target_mode.vtotal : crtc->mode.vtotal,
+            o.target_refresh_millihz ? target_mode.vscan : crtc->mode.vscan,
             (double)phase_mode_period_ns / 1e6,
             1e9 / (double)phase_mode_period_ns
         );
@@ -2720,10 +2990,11 @@ int main(
         "No userspace framebuffer copy.\n"
         "V4L2 NV24 DMABUF -> DRM FB "
         "-> atomic KMS plane.\n"
-        "Consolidated V3.6 build: "
-        "V3.4 lifetime and V3.6 phase instrumentation available.\n"
+        "Consolidated V3.7 build: "
+        "V3.4 lifetime, V3.6 phase, and V3.7 cadence instrumentation available.\n"
         "Atomic commit mode: %s\n"
         "Phase profiler: %s\n"
+        "Target refresh: %s\n"
         "Timing CSV: %s\n"
         "Auto-stop: %d seconds.\n\n",
 
@@ -2734,6 +3005,10 @@ int main(
         o.phase_profile
         ? "enabled"
         : "disabled",
+
+        o.target_refresh_millihz
+        ? "advertised-mode experiment"
+        : "unchanged active mode",
 
         o.csv_path,
         o.seconds
@@ -2950,6 +3225,39 @@ int main(
         }
 
 
+        /* Verify the first modeset after its completed OUT fence. */
+        if (target_mode_applied && !target_mode_verified) {
+            drmModeCrtc* applied = drmModeGetCrtc(drmfd, crtc_id);
+
+            if (!applied ||
+                !applied->mode_valid ||
+                !same_mode_timing(&applied->mode, &target_mode)) {
+
+                fprintf(
+                    stderr,
+                    "V3.7 could not verify that the target CRTC timing "
+                    "became active.\n"
+                );
+
+                if (applied)
+                    drmModeFreeCrtc(applied);
+
+                run_failed = true;
+                break;
+            }
+
+            fprintf(
+                stderr,
+                "V3.7 target timing verified active: %u.%03u Hz\n",
+                mode_refresh_millihz(&applied->mode) / 1000U,
+                mode_refresh_millihz(&applied->mode) % 1000U
+            );
+
+            drmModeFreeCrtc(applied);
+            target_mode_verified = true;
+        }
+
+
         /*
          * Rockchip HDMI-RX low-latency fence.
          */
@@ -3018,6 +3326,10 @@ int main(
         const bool async_this_commit =
             o.async_flip &&
             displayed >= 0;
+
+        const bool modeset_this_commit =
+            o.target_refresh_millihz &&
+            !target_mode_applied;
 
         int out_fence = -1;
 
@@ -3091,6 +3403,25 @@ int main(
         }
 
 
+        if (modeset_this_commit &&
+            add_modeset_props(
+                ar,
+                conn->connector_id,
+                crtc_id,
+                &mp,
+                target_mode_blob) < 0) {
+
+            perror("add V3.7 modeset properties");
+            drmModeAtomicFree(ar);
+
+            if (in_fence >= 0)
+                close(in_fence);
+
+            run_failed = true;
+            break;
+        }
+
+
         if (!async_this_commit &&
             drmModeAtomicAddProperty(
             ar,
@@ -3140,7 +3471,9 @@ int main(
 
 
         uint32_t commit_flags =
-            DRM_MODE_ATOMIC_NONBLOCK;
+            modeset_this_commit
+            ? DRM_MODE_ATOMIC_ALLOW_MODESET
+            : DRM_MODE_ATOMIC_NONBLOCK;
 
 
         if (async_this_commit) {
@@ -3202,6 +3535,18 @@ int main(
 
             run_failed = true;
             break;
+        }
+
+
+        if (modeset_this_commit) {
+            target_mode_applied = true;
+
+            fprintf(
+                stderr,
+                "V3.7 target timing applied: %u.%03u Hz\n",
+                mode_refresh_millihz(&target_mode) / 1000U,
+                mode_refresh_millihz(&target_mode) % 1000U
+            );
         }
 
 
@@ -3510,6 +3855,66 @@ out:
     /* --------------------------------------------------------------------- */
     /* Cleanup                                                               */
     /* --------------------------------------------------------------------- */
+
+    if (drmfd >= 0 &&
+        mode_changed &&
+        target_mode_applied &&
+        original_mode_blob &&
+        plane) {
+
+        drmModeAtomicReq* restore = drmModeAtomicAlloc();
+        bool restore_ok = restore != NULL;
+
+        if (restore_ok &&
+            (drmModeAtomicAddProperty(
+                restore,
+                plane->plane_id,
+                pp.fb_id,
+                0) < 0 ||
+             drmModeAtomicAddProperty(
+                restore,
+                plane->plane_id,
+                pp.crtc_id,
+                0) < 0 ||
+             add_modeset_props(
+                restore,
+                conn->connector_id,
+                crtc_id,
+                &mp,
+                original_mode_blob) < 0)) {
+
+            restore_ok = false;
+        }
+
+        if (restore_ok &&
+            drmModeAtomicCommit(
+                drmfd,
+                restore,
+                DRM_MODE_ATOMIC_ALLOW_MODESET,
+                NULL) < 0) {
+
+            restore_ok = false;
+        }
+
+        if (restore)
+            drmModeAtomicFree(restore);
+
+        if (restore_ok) {
+            fprintf(stderr, "Restored original DRM mode after V3.7 run.\n");
+        }
+        else {
+            perror("restore original DRM mode");
+            rc = 1;
+        }
+    }
+
+
+    if (drmfd >= 0 && target_mode_blob)
+        drmModeDestroyPropertyBlob(drmfd, target_mode_blob);
+
+    if (drmfd >= 0 && original_mode_blob)
+        drmModeDestroyPropertyBlob(drmfd, original_mode_blob);
+
 
     if (drmfd >= 0) {
 

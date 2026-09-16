@@ -27,7 +27,8 @@ The active path has **no GStreamer, no CPU colour conversion, no framebuffer cop
 - baseline explicit sync: plane `IN_FENCE_FD` + CRTC `OUT_FENCE_PTR`
 - stable capture pool: **4 buffers minimum** at the characterized ~60 Hz mode
 - V3.5 result: **atomic async rejected as unsupported by the Rockchip 6.1 driver**
-- current experiment: **V3.6 non-invasive CRTC/vblank phase profiler**
+- V3.6 result: **59.94 Hz input against exact 60.000 Hz output caused eight periodic two-vblank waits**
+- current experiment: **V3.7 EDID-advertised 59.94 Hz cadence-alignment A/B test**
 - long-term target: **1080p240**
 
 Connector/plane IDs are machine-specific. The defaults above are the proven test platform values.
@@ -109,6 +110,18 @@ The default 120-second trace records the active mode period, V4L2 timestamp flag
 
 Use the high-speed camera during the run. Keep both Windows outputs on the same duplicated image and record which connector/GPU drives each display. The direct MSI-to-Zowie control measured about 16 ms; the path through the Orange Pi measured about 33 ms, so the current working estimate is approximately one additional 16.7 ms display period inside the passthrough path.
 
+The hardware trace contained 7,126 post-warmup rows, no sequence gaps and no missing fences. It found eight two-vblank completions spaced approximately 980 frames apart: a 59.94 Hz HDMI-RX cadence beating against the exact 60.000 Hz CRTC. The corrected analyzer reports these cadence wraps explicitly instead of reducing the sawtooth to a misleading endpoint drift number.
+
+## V3.7 60.000-vs-59.94 Hz A/B test
+
+```bash
+sudo bash ./scripts/run-v37-cadence-alignment.sh
+```
+
+The first 120-second arm preserves the active output timing. The second requests `59940` millihertz and only accepts a matching mode already advertised by the connected display. The mode change is part of the first atomic NV24 commit and the original mode is restored on exit. V3.7 never synthesizes an unadvertised mode and never changes the DMA-BUF/fence/ownership path.
+
+Results go to `/tmp/hdmirx-v37/`. Success means the aligned arm retains zero capture gaps/fence failures and materially reduces or eliminates the periodic two-vblank completions. It is not expected to remove the normal one-vblank `commit → OUT` interval.
+
 ## Analyze an existing trace
 
 ```bash
@@ -175,10 +188,12 @@ When an experiment is proven, merge it to `main` and create a new annotated tag 
 - `docs/DEVELOPMENT_HISTORY.md` — consolidated history and historical-package issues
 - `docs/VERSIONING.md` — rollback-safe tags and experiment branches
 - `docs/V36_RUNBOOK.md` — GitHub upload, Pi update, build and verification commands
+- `docs/V37_RUNBOOK.md` — V3.7 update, A/B run and recovery procedure
 - `docs/results/v3.3-buffer-sweep.md` — buffer-count conclusion
 - `docs/results/v3.4-buffer-lifetime.md` — measured phase/ownership result
 - `docs/results/v3.5-async-result.md` — Linux 6.1 atomic-async rejection
 - `docs/results/v3.6-phase-profiler.md` — test procedure and interpretation
+- `docs/results/v3.7-cadence-alignment.md` — hypothesis and pass criteria
 
 ## License
 
