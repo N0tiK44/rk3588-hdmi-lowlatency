@@ -1,7 +1,7 @@
 CC ?= cc
 PKG_CONFIG ?= pkg-config
-TARGET := hdmirx-kms-lowlat
-SRC := src/hdmirx-kms-lowlat.c
+TARGET := rk3588-hdmi-passthrough
+SRC := src/passthrough.c
 
 CPPFLAGS += $(shell $(PKG_CONFIG) --cflags libdrm 2>/dev/null)
 CFLAGS ?= -O2 -g
@@ -18,7 +18,7 @@ $(TARGET): $(SRC)
 check:
 	$(CC) $(CPPFLAGS) $(CFLAGS) -fsyntax-only $(SRC)
 	python3 -m py_compile tools/analyze.py
-	bash -n scripts/run-baseline.sh scripts/run-v35-phase.sh scripts/run-v36-phase-profiler.sh scripts/run-v37-cadence-alignment.sh scripts/run-v38-early-submit.sh scripts/run-v381-safe-window.sh scripts/pi-debug.sh scripts/pi-run-and-package.sh
+	bash -n scripts/run.sh scripts/diagnose.sh scripts/pi-update-and-diagnose.sh
 
 clean:
 	rm -f $(TARGET)

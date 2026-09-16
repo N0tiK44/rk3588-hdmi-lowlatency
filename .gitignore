@@ -1,11 +1,12 @@
 # Native build products
-/hdmirx-kms-lowlat
+/rk3588-hdmi-passthrough
 *.o
 
 # Measurement output
 *.csv
 *.log
 report.txt
+*.tar.gz
 
 # Python bytecode
 __pycache__/

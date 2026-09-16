@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze RK3588 HDMI-RX/KMS V3.4-V3.8 timing CSV traces."""
+"""Analyze RK3588 HDMI-RX/KMS passthrough timing CSV traces."""
 from __future__ import annotations
 
 import csv
@@ -74,13 +74,7 @@ def load_csv(path):
 
 def analyze(path):
     rows = load_csv(path)
-    sync_rows = sum(integer(r.get("async_commit")) == 0 for r in rows)
-    async_rows = sum(integer(r.get("async_commit")) == 1 for r in rows)
-    early_rows = sum(integer(r.get("early_submit")) == 1 for r in rows)
-    overlap_rows = sum(integer(r.get("overlap_commit")) == 1 for r in rows)
-    intentional_drops = sum(integer(r.get("intentional_drops_before")) or 0 for r in rows)
-    if async_rows:
-        rows = [r for r in rows if integer(r.get("async_commit")) == 1]
+    window_rows = sum(integer(r.get("window_profile")) == 1 for r in rows)
 
     metrics = defaultdict(list)
     seq_gaps = missing_fences = phase_rows = monotonic_rows = soe_rows = 0
@@ -194,11 +188,9 @@ def analyze(path):
         if a is not None and b is not None
     ]
     return {
-        "path": str(path), "rows": len(rows), "sync_rows": sync_rows,
-        "async_rows": async_rows, "early_rows": early_rows,
-        "overlap_rows": overlap_rows, "seq_gaps": seq_gaps,
-        "intentional_drops": intentional_drops,
-        "unexpected_gaps": max(0, seq_gaps - intentional_drops),
+        "path": str(path), "rows": len(rows), "window_rows": window_rows,
+        "seq_gaps": seq_gaps,
+        "unexpected_gaps": seq_gaps,
         "missing_fences": missing_fences, "metrics": metrics,
         "per_index_reuse": per_index_reuse, "phase_rows": phase_rows,
         "monotonic_rows": monotonic_rows, "soe_rows": soe_rows,
@@ -227,20 +219,14 @@ def metric_line(label, xs, unit="time"):
 def show(label, result):
     m = result["metrics"]
     print(f"{label}: {result['path']} ({result['rows']} post-warmup rows)")
-    print(f"  commit modes: normal={result['sync_rows']} async={result['async_rows']}")
+    print("  commit mode: normal atomic")
     print(
         "  sequence gaps: "
-        f"raw={result['seq_gaps']} intentional={result['intentional_drops']} "
-        f"unexpected={result['unexpected_gaps']}   "
+        f"raw={result['seq_gaps']} unexpected={result['unexpected_gaps']}   "
         f"missing acquire fences: {result['missing_fences']}"
     )
-    if result["early_rows"]:
-        print(f"  early-window profiler rows: {result['early_rows']}")
-        if result["overlap_rows"] or result["intentional_drops"]:
-            print(
-                f"  V3.8 overlap rows: {result['overlap_rows']}   "
-                f"intentional drops: {result['intentional_drops']}"
-            )
+    if result["window_rows"]:
+        print(f"  readiness-window profiler rows: {result['window_rows']}")
     for title, key in (
         ("V4L2 timestamp cadence", "v4l2_period"), ("DQ -> next DQ", "dq_period"),
         ("OUT -> next OUT", "out_period"), ("previous OUT -> DQ", "prev_out_to_dq"),
@@ -254,7 +240,7 @@ def show(label, result):
         values = ", ".join(f"b{i}={fmt_us(median(result['per_index_reuse'][i]))}" for i in sorted(result["per_index_reuse"]))
         print("  per-index reuse p50:          " + values)
     if result["phase_rows"]:
-        print("\n  V3.6 phase profiler:")
+        print("\n  phase profiler:")
         print(f"  valid rows: {result['phase_rows']}   monotonic timestamps: {result['monotonic_rows']}   SOE timestamps: {result['soe_rows']}")
         for title, key in (
             ("V4L2 timestamp -> DQ", "v4l2_timestamp_to_dq"),
@@ -265,7 +251,7 @@ def show(label, result):
             print(metric_line(title, m[key]))
         print(metric_line("DQ -> commit vblank steps", m["dq_to_commit_vblank_advance"], "count"))
         print(metric_line("commit -> OUT vblank steps", m["commit_to_out_vblank_advance"], "count"))
-        print("\n  V3.7 cadence diagnosis:")
+        print("\n  cadence diagnosis:")
         print(f"  measured input cadence:      {result['input_hz']:.6f} Hz")
         print(f"  active output cadence:       {result['output_hz']:.6f} Hz")
         beat = (
@@ -282,16 +268,14 @@ def show(label, result):
 
 def main(argv):
     if len(argv) not in (2, 3):
-        raise SystemExit("usage: analyze.py TRACE.csv [ASYNC.csv]")
+        raise SystemExit("usage: analyze.py TRACE.csv [COMPARISON.csv]")
     normal = analyze(argv[1])
     print("=== RK3588 HDMI-RX / KMS TIMING REPORT ===")
     show("REFERENCE" if len(argv) == 3 else "TRACE", normal)
     if len(argv) == 3:
         comparison = analyze(argv[2])
         print()
-        is_async = comparison["async_rows"] > 0
-        is_early = comparison["early_rows"] > 0
-        show("ASYNC" if is_async else ("EARLY" if is_early else "ALIGNED"), comparison)
+        show("COMPARISON", comparison)
         gain = median(normal["metrics"]["commit_to_out"]) - median(comparison["metrics"]["commit_to_out"])
         print(f"\nCompletion median improvement: {gain / 1000.0:.3f} ms")
         print(

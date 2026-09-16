@@ -22,16 +22,6 @@
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
 
-#ifndef DRM_MODE_PAGE_FLIP_ASYNC
-#define DRM_MODE_PAGE_FLIP_ASYNC 0x02
-#endif
-
-/* Added after Linux 6.1; keep the diagnostic build source-compatible with
- * older libdrm header packages while still querying the correct atomic cap. */
-#ifndef DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP
-#define DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP 0x15
-#endif
-
 #ifndef DRM_FORMAT_NV24
 #define DRM_FORMAT_NV24 fourcc_code('N','V','2','4')
 #endif
@@ -40,14 +30,7 @@
 #define MAX_SAMPLES 65536
 
 /*
- * CONSOLIDATED V3.7 CADENCE-ALIGNMENT BUILD
- *
- * Working V2 zero-copy path
- * + V3 measurement instrumentation
- * + V3.4 buffer-lifetime instrumentation
- * + V3.5 async page-flip A/B experiment
- * + V3.6 CRTC/vblank phase instrumentation
- * + V3.7 advertised-mode 59.94 Hz alignment experiment
+ * RK3588 HDMI PASSTHROUGH V1.0
  *
  * Current proven architecture:
  *
@@ -74,10 +57,7 @@ struct frame_sample {
     uint32_t sequence;
     uint32_t index;
     int fence_present;
-    int async_commit;
-    int early_submit;
-    int overlap_commit;
-    uint32_t intentional_drops_before;
+    int window_profile;
 
     uint64_t v4l2_ts_ns;
     uint64_t dq_ns;
@@ -104,10 +84,10 @@ static volatile sig_atomic_t g_stop = 0;
 
 
 /* ------------------------------------------------------------------------- */
-/* V3.4 buffer-lifetime instrumentation                                      */
+/* Buffer-lifetime instrumentation                                            */
 /* ------------------------------------------------------------------------- */
 
-static void v34_mark_qbuf(uint32_t index, uint64_t when_ns)
+static void mark_qbuf(uint32_t index, uint64_t when_ns)
 {
     for (size_t n = g_sample_count; n > 0; n--) {
         struct frame_sample* x = &g_samples[n - 1];
@@ -124,7 +104,7 @@ static void v34_mark_qbuf(uint32_t index, uint64_t when_ns)
 /* Timing helpers                                                            */
 /* ------------------------------------------------------------------------- */
 
-static uint64_t v3_mono_ns(void)
+static uint64_t mono_ns(void)
 {
     struct timespec ts;
 
@@ -135,14 +115,14 @@ static uint64_t v3_mono_ns(void)
 }
 
 
-static uint64_t v3_timeval_ns(const struct timeval* tv)
+static uint64_t timeval_ns(const struct timeval* tv)
 {
     return (uint64_t)tv->tv_sec * 1000000000ULL +
         (uint64_t)tv->tv_usec * 1000ULL;
 }
 
 
-static uint64_t v36_mode_period_ns(const drmModeModeInfo* mode)
+static uint64_t mode_period_ns(const drmModeModeInfo* mode)
 {
     if (!mode ||
         !mode->clock ||
@@ -177,7 +157,7 @@ static uint64_t v36_mode_period_ns(const drmModeModeInfo* mode)
 
 static uint32_t mode_refresh_millihz(const drmModeModeInfo* mode)
 {
-    uint64_t period_ns = v36_mode_period_ns(mode);
+    uint64_t period_ns = mode_period_ns(mode);
 
     if (!period_ns)
         return 0;
@@ -201,7 +181,7 @@ static const drmModeModeInfo* pick_refresh_mode(
 
     fprintf(
         stderr,
-        "Advertised %ux%u modes for V3.7:\n",
+        "Advertised %ux%u modes:\n",
         width,
         height
     );
@@ -263,7 +243,7 @@ static bool same_mode_timing(
 }
 
 
-static int v3_cmp_double(const void* a, const void* b)
+static int cmp_double(const void* a, const void* b)
 {
     double da = *(const double*)a;
     double db = *(const double*)b;
@@ -272,7 +252,7 @@ static int v3_cmp_double(const void* a, const void* b)
 }
 
 
-static void v3_metric(const char* name, const double* src, size_t n)
+static void print_metric(const char* name, const double* src, size_t n)
 {
     if (!n) {
         fprintf(stderr, "%-29s : no samples\n", name);
@@ -287,7 +267,7 @@ static void v3_metric(const char* name, const double* src, size_t n)
     }
 
     memcpy(v, src, n * sizeof(*v));
-    qsort(v, n, sizeof(*v), v3_cmp_double);
+    qsort(v, n, sizeof(*v), cmp_double);
 
     double sum = 0.0;
 
@@ -315,7 +295,7 @@ static void v3_metric(const char* name, const double* src, size_t n)
 }
 
 
-static void v3_print_summary(void)
+static void print_summary(void)
 {
     if (!g_sample_count)
         return;
@@ -345,7 +325,7 @@ static void v3_print_summary(void)
         !commit_out ||
         !dq_out) {
 
-        fprintf(stderr, "V3 summary allocation failed\n");
+        fprintf(stderr, "Timing-summary allocation failed\n");
 
         free(dq_period);
         free(v4l2_period);
@@ -362,11 +342,8 @@ static void v3_print_summary(void)
     size_t stage_n = 0;
 
     uint64_t seq_gaps = 0;
-    uint64_t intentional_drops = 0;
-
     for (size_t i = 0; i < g_sample_count; i++) {
         const struct frame_sample* x = &g_samples[i];
-        intentional_drops += x->intentional_drops_before;
 
         if (i) {
             const struct frame_sample* p =
@@ -428,11 +405,8 @@ static void v3_print_summary(void)
 
     fprintf(
         stderr,
-        "V4L2 sequence gaps             : %" PRIu64
-        " raw, %" PRIu64 " intentional, %" PRIu64 " unexpected\n",
-        seq_gaps,
-        intentional_drops,
-        seq_gaps > intentional_drops ? seq_gaps - intentional_drops : 0
+        "V4L2 sequence gaps             : %" PRIu64 "\n",
+        seq_gaps
     );
 
     fprintf(
@@ -442,37 +416,37 @@ static void v3_print_summary(void)
         g_samples[g_sample_count - 1].sequence
     );
 
-    v3_metric(
+    print_metric(
         "DQBUF -> next DQBUF",
         dq_period,
         dq_n
     );
 
-    v3_metric(
+    print_metric(
         "V4L2 timestamp cadence",
         v4l2_period,
         v4l2_n
     );
 
-    v3_metric(
+    print_metric(
         "DQBUF -> commit call",
         dq_commit,
         stage_n
     );
 
-    v3_metric(
+    print_metric(
         "atomic commit ioctl",
         commit_ioctl,
         stage_n
     );
 
-    v3_metric(
+    print_metric(
         "commit return -> completion",
         commit_out,
         stage_n
     );
 
-    v3_metric(
+    print_metric(
         "DQBUF -> completion",
         dq_out,
         stage_n
@@ -491,7 +465,7 @@ static void v3_print_summary(void)
 /* CSV output                                                                */
 /* ------------------------------------------------------------------------- */
 
-static int v3_write_csv(const char* path)
+static int write_csv(const char* path)
 {
     FILE* f = fopen(path, "w");
 
@@ -504,10 +478,7 @@ static int v3_write_csv(const char* path)
         "sequence,"
         "index,"
         "fence_present,"
-        "async_commit,"
-        "early_submit,"
-        "overlap_commit,"
-        "intentional_drops_before,"
+        "window_profile,"
         "v4l2_ts_ns,"
         "dq_ns,"
         "commit_begin_ns,"
@@ -572,9 +543,6 @@ static int v3_write_csv(const char* path)
             "%u,"
             "%d,"
             "%d,"
-            "%d,"
-            "%d,"
-            "%u,"
             "%" PRIu64 ","
             "%" PRIu64 ","
             "%" PRIu64 ","
@@ -599,10 +567,7 @@ static int v3_write_csv(const char* path)
             x->sequence,
             x->index,
             x->fence_present,
-            x->async_commit,
-            x->early_submit,
-            x->overlap_commit,
-            x->intentional_drops_before,
+            x->window_profile,
             x->v4l2_ts_ns,
             x->dq_ns,
             x->commit_begin_ns,
@@ -646,9 +611,8 @@ struct opts {
 
     bool enable_low_latency;
     bool verbose;
-    bool async_flip;
     bool phase_profile;
-    bool early_submit;
+    bool window_profile;
     uint32_t target_refresh_millihz;
 
     const char* csv_path;
@@ -779,86 +743,6 @@ static int wait_fd(int fd, int timeout_ms)
     if (!(p.revents & POLLIN)) {
         errno = EIO;
         return -1;
-    }
-
-    return 0;
-}
-
-
-struct flip_wait {
-    bool done;
-    uint64_t signal_ns;
-};
-
-
-static void page_flip_handler(
-    int fd,
-    unsigned int sequence,
-    unsigned int tv_sec,
-    unsigned int tv_usec,
-    void* user_data
-)
-{
-    (void)fd;
-    (void)sequence;
-    (void)tv_sec;
-    (void)tv_usec;
-
-    struct flip_wait* wait = user_data;
-
-    wait->signal_ns = v3_mono_ns();
-    wait->done = true;
-}
-
-
-static int wait_flip_event(
-    int drmfd,
-    struct flip_wait* wait,
-    int timeout_ms
-)
-{
-    drmEventContext event = {
-        .version = DRM_EVENT_CONTEXT_VERSION,
-        .page_flip_handler = page_flip_handler,
-    };
-
-    while (!wait->done) {
-        struct pollfd p = {
-            .fd = drmfd,
-            .events = POLLIN,
-        };
-
-        int r;
-
-        do {
-            r = poll(&p, 1, timeout_ms);
-        } while (r < 0 && errno == EINTR && !g_stop);
-
-        if (r == 0) {
-            errno = ETIMEDOUT;
-            return -1;
-        }
-
-        if (r < 0)
-            return -1;
-
-        if (p.revents & POLLNVAL) {
-            errno = EBADF;
-            return -1;
-        }
-
-        if (p.revents & (POLLERR | POLLHUP)) {
-            errno = EIO;
-            return -1;
-        }
-
-        if (!(p.revents & POLLIN)) {
-            errno = EIO;
-            return -1;
-        }
-
-        if (drmHandleEvent(drmfd, &event) < 0)
-            return -1;
     }
 
     return 0;
@@ -1461,52 +1345,6 @@ static int add_plane_props(
 }
 
 
-/*
- * Atomic async flips are deliberately restricted to a pure framebuffer
- * replacement (plus the acquire fence).  Re-submitting CRTC_ID, geometry or
- * OUT_FENCE_PTR turns the request into a state change that the atomic async
- * UAPI rejects.
- */
-static int add_async_plane_props(
-    drmModeAtomicReq* req,
-    uint32_t plane_id,
-    const struct drm_props* pp,
-    uint32_t fb_id,
-    int in_fence_fd
-)
-{
-    if (!pp->fb_id) {
-        errno = ENOENT;
-        return -1;
-    }
-
-    if (drmModeAtomicAddProperty(
-        req,
-        plane_id,
-        pp->fb_id,
-        fb_id) < 0) {
-
-        return -1;
-    }
-
-    if (pp->in_fence_fd &&
-        in_fence_fd >= 0) {
-
-        if (drmModeAtomicAddProperty(
-            req,
-            plane_id,
-            pp->in_fence_fd,
-            (uint64_t)(int64_t)
-            in_fence_fd) < 0) {
-
-            return -1;
-        }
-    }
-
-    return 0;
-}
-
-
 static int add_modeset_props(
     drmModeAtomicReq* req,
     uint32_t connector_id,
@@ -1566,10 +1404,9 @@ static void usage(
         "  --seconds N              auto-stop after N seconds (default 10)\n"
         "  --buffers N              V4L2 buffers 3..8 (default 4)\n"
         "  --no-low-latency         do not toggle rockchip_hdmirx low_latency\n"
-        "  --async-flip             request DRM_MODE_PAGE_FLIP_ASYNC (experimental)\n"
-        "  --phase-profile          record V3.6 CRTC/vblank phase data\n"
-        "  --target-refresh-millihz N  V3.7 advertised-mode test (59940)\n"
-        "  --early-submit           V3.8.1 safe CRTC-sequence window profiler\n"
+        "  --phase-profile          record CRTC/vblank phase data\n"
+        "  --window-profile         classify capture-ready/OUT-fence ordering\n"
+        "  --target-refresh-millihz N  select a matching EDID mode (59940)\n"
         "  --csv PATH               timing CSV (default /tmp/hdmirx-lowlat.csv)\n"
         "  -v, --verbose            extra per-frame output\n",
 
@@ -1612,13 +1449,10 @@ int main(
         .verbose =
             false,
 
-        .async_flip =
-            false,
-
         .phase_profile =
             false,
 
-        .early_submit =
+        .window_profile =
             false,
 
         .target_refresh_millihz =
@@ -1689,14 +1523,14 @@ int main(
             },
 
             {
-                "async-flip",
+                "phase-profile",
                 no_argument,
                 0,
                 9
             },
 
             {
-                "phase-profile",
+                "window-profile",
                 no_argument,
                 0,
                 10
@@ -1707,13 +1541,6 @@ int main(
                 required_argument,
                 0,
                 11
-            },
-
-            {
-                "early-submit",
-                no_argument,
-                0,
-                12
             },
 
             {
@@ -1812,12 +1639,12 @@ int main(
             break;
 
         case 9:
-            o.async_flip =
+            o.phase_profile =
                 true;
             break;
 
         case 10:
-            o.phase_profile =
+            o.window_profile =
                 true;
             break;
 
@@ -1829,10 +1656,6 @@ int main(
                 fprintf(stderr, "Invalid target refresh: %s\n", optarg);
                 return 2;
             }
-            break;
-
-        case 12:
-            o.early_submit = true;
             break;
 
         case 'v':
@@ -1855,42 +1678,16 @@ int main(
         o.num_buffers < 3 ||
         o.num_buffers > MAX_BUFS ||
         o.seconds < 1 ||
-        (o.async_flip && o.phase_profile) ||
-        (o.async_flip && o.early_submit) ||
-        (o.early_submit && !o.phase_profile) ||
-        (o.async_flip && o.target_refresh_millihz) ||
+        (o.window_profile && !o.phase_profile) ||
         (o.target_refresh_millihz &&
             (o.target_refresh_millihz < 1000U ||
              o.target_refresh_millihz > 1000000U))) {
 
         usage(argv[0]);
 
-        if (o.async_flip && o.phase_profile) {
-            fprintf(
-                stderr,
-                "--phase-profile intentionally measures only the normal "
-                "OUT_FENCE_PTR path; do not combine it with --async-flip.\n"
-            );
-        }
-
-        if (o.async_flip && o.early_submit) {
+        if (o.window_profile && !o.phase_profile) {
             fprintf(stderr,
-                "--early-submit profiles normal atomic OUT fences and cannot be "
-                "combined with --async-flip.\n");
-        }
-
-        if (o.early_submit && !o.phase_profile) {
-            fprintf(stderr,
-                "--early-submit requires --phase-profile for auditable data.\n");
-        }
-
-
-        if (o.async_flip && o.target_refresh_millihz) {
-            fprintf(
-                stderr,
-                "V3.7 cadence alignment uses the normal OUT_FENCE_PTR "
-                "path and cannot be combined with --async-flip.\n"
-            );
+                "--window-profile requires --phase-profile for auditable data.\n");
         }
 
         return 2;
@@ -2227,7 +2024,7 @@ int main(
         if (!timestamp_monotonic) {
             fprintf(
                 stderr,
-                "V3.6 requires monotonic DRM vblank timestamps so they "
+                "Phase profiling requires monotonic DRM vblank timestamps so they "
                 "share a clock domain with DQ/commit measurements.\n"
             );
 
@@ -2238,61 +2035,6 @@ int main(
             stderr,
             "DRM monotonic vblank timestamps: yes\n"
         );
-    }
-
-
-    if (o.async_flip) {
-        uint64_t atomic_async_cap = 0;
-        uint64_t legacy_async_cap = 0;
-        int atomic_cap_result;
-        int atomic_cap_errno;
-
-        /*
-         * DRM_CAP_ASYNC_PAGE_FLIP describes the legacy page-flip ioctl.
-         * Atomic async commits have a separate capability.  Linux 6.1 does
-         * not implement that newer capability and rejects the async flag in
-         * the atomic ioctl.  Because this program is an explicit diagnostic,
-         * continue to one real atomic attempt after a clear warning: this
-         * also detects vendor backports that accept the flag without
-         * advertising the newer capability.
-         */
-        atomic_cap_result = drmGetCap(
-            drmfd,
-            DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP,
-            &atomic_async_cap
-        );
-        atomic_cap_errno = errno;
-
-        if (drmGetCap(
-            drmfd,
-            DRM_CAP_ASYNC_PAGE_FLIP,
-            &legacy_async_cap) < 0) {
-
-            legacy_async_cap = 0;
-        }
-
-        if (atomic_cap_result == 0 && atomic_async_cap) {
-            fprintf(
-                stderr,
-                "DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP=yes "
-                "(legacy async=%" PRIu64 "); "
-                "the first frame will seed the plane synchronously.\n",
-                legacy_async_cap
-            );
-        }
-        else {
-            fprintf(
-                stderr,
-                "WARNING: DRM does not advertise atomic async page flips "
-                "(query=%s, value=%" PRIu64 ", legacy async=%" PRIu64 ").\n"
-                "V3.5 will issue one diagnostic atomic async commit; "
-                "EINVAL/unsupported is expected on Linux 6.1 and does not "
-                "invalidate the V3.4 baseline.\n",
-                atomic_cap_result == 0 ? "ok" : strerror(atomic_cap_errno),
-                atomic_async_cap,
-                legacy_async_cap
-            );
-        }
     }
 
 
@@ -2396,7 +2138,7 @@ int main(
             stderr,
             "The selected CRTC is not "
             "already active.\n"
-            "V3.7 only changes timing from an already-active, "
+            "Target-mode selection only changes timing from an already-active, "
             "matching-resolution mode.\n"
             "Boot/leave the display at "
             "1920x1080 first, then retry.\n"
@@ -2428,7 +2170,7 @@ int main(
             fprintf(
                 stderr,
                 "No EDID-advertised %ux%u mode within 0.005 Hz of "
-                "%u.%03u Hz. V3.7 refuses to synthesize an unadvertised "
+                "%u.%03u Hz. The program refuses to synthesize an unadvertised "
                 "timing.\n",
                 w,
                 h,
@@ -2462,7 +2204,7 @@ int main(
         );
 
         if (!mp.connector_crtc_id || !mp.crtc_mode_id || !mp.crtc_active) {
-            fprintf(stderr, "V3.7 modeset properties are unavailable.\n");
+            fprintf(stderr, "modeset properties are unavailable.\n");
             goto out;
         }
 
@@ -2472,7 +2214,7 @@ int main(
                 sizeof(target_mode),
                 &target_mode_blob) < 0) {
 
-            perror("create V3.7 target mode blob");
+            perror("create target mode blob");
             goto out;
         }
 
@@ -2489,7 +2231,7 @@ int main(
 
         fprintf(
             stderr,
-            "V3.7 target mode: %s clock=%u kHz refresh=%u.%03u Hz "
+            "Target mode: %s clock=%u kHz refresh=%u.%03u Hz "
             "(%s)\n",
             target_mode.name,
             target_mode.clock,
@@ -2501,7 +2243,7 @@ int main(
 
 
     uint64_t phase_mode_period_ns =
-        v36_mode_period_ns(
+        mode_period_ns(
             o.target_refresh_millihz
             ? &target_mode
             : &crtc->mode
@@ -3036,29 +2778,24 @@ int main(
         "No userspace framebuffer copy.\n"
         "V4L2 NV24 DMABUF -> DRM FB "
         "-> atomic KMS plane.\n"
-        "Consolidated V3.8.1 build: "
-        "safe CRTC-sequence early-window instrumentation; no experimental drop.\n"
-        "Atomic commit mode: %s\n"
+        "V1.0 stable datapath with optional non-invasive diagnostics.\n"
+        "Atomic commit mode: normal/vblank\n"
         "Phase profiler: %s\n"
-        "Early-submit probe: %s\n"
+        "Readiness-window profiler: %s\n"
         "Target refresh: %s\n"
         "Timing CSV: %s\n"
         "Auto-stop: %d seconds.\n\n",
-
-        o.async_flip
-        ? "ASYNC (experimental)"
-        : "normal/vblank",
 
         o.phase_profile
         ? "enabled"
         : "disabled",
 
-        o.early_submit
+        o.window_profile
         ? "enabled (observation only; no DQ/drop/overlap)"
         : "disabled",
 
         o.target_refresh_millihz
-        ? "advertised-mode experiment"
+        ? "selected from connector EDID"
         : "unchanged active mode",
 
         o.csv_path,
@@ -3083,10 +2820,10 @@ int main(
     uint64_t frames = 0;
     uint64_t missing_fences = 0;
     uint64_t acquire_waits = 0;
-    uint64_t v381_capture_ready_before_out = 0;
-    uint64_t v381_out_before_or_equal_ready = 0;
-    uint64_t v381_pre_latch_opportunities = 0;
-    uint64_t v381_post_latch_fence_races = 0;
+    uint64_t window_capture_ready_before_out = 0;
+    uint64_t window_out_before_or_equal_ready = 0;
+    uint64_t window_pre_latch_opportunities = 0;
+    uint64_t window_post_latch_fence_races = 0;
 
     /*
      * IMPORTANT:
@@ -3094,7 +2831,7 @@ int main(
      * Previous consolidated source returned success whenever
      * frames > 0, even if a fatal DRM/V4L2 error occurred later.
      *
-     * V3.5/V3.6 measurements depend on trustworthy exit codes.
+     * Measurements depend on trustworthy exit codes.
      */
     bool run_failed = false;
 
@@ -3217,24 +2954,24 @@ int main(
 
 
         const uint64_t
-            v3_dq_ns =
-            v3_mono_ns();
+            dq_ns =
+            mono_ns();
 
 
         const uint64_t
-            v3_v4l2_ts_ns =
-            v3_timeval_ns(
+            v4l2_ts_ns =
+            timeval_ns(
                 &b.timestamp
             );
 
 
         const uint32_t
-            v3_sequence =
+            capture_sequence =
             b.sequence;
 
 
         const uint32_t
-            v36_v4l2_flags =
+            v4l2_flags =
             b.flags;
 
         if (o.phase_profile && frames == 0) {
@@ -3246,7 +2983,7 @@ int main(
 
             fprintf(
                 stderr,
-                "V3.6 V4L2 timestamp flags: raw=0x%08x "
+                "V4L2 timestamp flags: raw=0x%08x "
                 "clock=%s source=%s\n",
                 b.flags,
                 timestamp_type == V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC
@@ -3263,15 +3000,15 @@ int main(
         }
 
 
-        uint64_t v36_dq_vblank_sequence = 0;
-        uint64_t v36_dq_vblank_ns = 0;
+        uint64_t dq_vblank_sequence = 0;
+        uint64_t dq_vblank_ns = 0;
 
         if (o.phase_profile &&
             drmCrtcGetSequence(
                 drmfd,
                 crtc_id,
-                &v36_dq_vblank_sequence,
-                &v36_dq_vblank_ns) < 0) {
+                &dq_vblank_sequence,
+                &dq_vblank_ns) < 0) {
 
             perror("drmCrtcGetSequence at DQ");
             run_failed = true;
@@ -3289,7 +3026,7 @@ int main(
 
                 fprintf(
                     stderr,
-                    "V3.7 could not verify that the target CRTC timing "
+                    "Could not verify that the target CRTC timing "
                     "became active.\n"
                 );
 
@@ -3302,7 +3039,7 @@ int main(
 
             fprintf(
                 stderr,
-                "V3.7 target timing verified active: %u.%03u Hz\n",
+                "Target timing verified active: %u.%03u Hz\n",
                 mode_refresh_millihz(&applied->mode) / 1000U,
                 mode_refresh_millihz(&applied->mode) % 1000U
             );
@@ -3377,21 +3114,11 @@ int main(
         }
 
 
-        const bool async_this_commit =
-            o.async_flip &&
-            displayed >= 0;
-
         const bool modeset_this_commit =
             o.target_refresh_millihz &&
             !target_mode_applied;
 
         int out_fence = -1;
-
-        struct flip_wait flip = {
-            .done = false,
-            .signal_ns = 0,
-        };
-
 
         drmModeAtomicReq* ar =
             drmModeAtomicAlloc();
@@ -3411,41 +3138,23 @@ int main(
         }
 
 
-        int add_result;
-
-        if (async_this_commit) {
-            add_result =
-                add_async_plane_props(
-                    ar,
-                    plane->plane_id,
-                    &pp,
-                    bufs[b.index].fb_id,
-                    in_fence
-                );
-        }
-        else {
-            add_result =
-                add_plane_props(
-                    drmfd,
-                    ar,
-                    plane->plane_id,
-                    &pp,
-                    crtc_id,
-                    bufs[b.index].fb_id,
-                    w,
-                    h,
-                    in_fence
-                );
-        }
+        int add_result =
+            add_plane_props(
+                drmfd,
+                ar,
+                plane->plane_id,
+                &pp,
+                crtc_id,
+                bufs[b.index].fb_id,
+                w,
+                h,
+                in_fence
+            );
 
 
         if (add_result < 0) {
 
-            perror(
-                async_this_commit
-                ? "add async plane props"
-                : "add plane props"
-            );
+            perror("add plane props");
 
             drmModeAtomicFree(ar);
 
@@ -3465,7 +3174,7 @@ int main(
                 &mp,
                 target_mode_blob) < 0) {
 
-            perror("add V3.7 modeset properties");
+            perror("add modeset properties");
             drmModeAtomicFree(ar);
 
             if (in_fence >= 0)
@@ -3476,8 +3185,7 @@ int main(
         }
 
 
-        if (!async_this_commit &&
-            drmModeAtomicAddProperty(
+        if (drmModeAtomicAddProperty(
             ar,
             crtc_id,
             pp.out_fence_ptr,
@@ -3498,15 +3206,15 @@ int main(
         }
 
 
-        uint64_t v36_commit_vblank_sequence = 0;
-        uint64_t v36_commit_vblank_ns = 0;
+        uint64_t commit_vblank_sequence = 0;
+        uint64_t commit_vblank_ns = 0;
 
         if (o.phase_profile &&
             drmCrtcGetSequence(
                 drmfd,
                 crtc_id,
-                &v36_commit_vblank_sequence,
-                &v36_commit_vblank_ns) < 0) {
+                &commit_vblank_sequence,
+                &commit_vblank_ns) < 0) {
 
             perror("drmCrtcGetSequence before commit");
             drmModeAtomicFree(ar);
@@ -3520,8 +3228,8 @@ int main(
 
 
         const uint64_t
-            v3_commit_begin_ns =
-            v3_mono_ns();
+            commit_begin_ns =
+            mono_ns();
 
 
         uint32_t commit_flags =
@@ -3530,27 +3238,18 @@ int main(
             : DRM_MODE_ATOMIC_NONBLOCK;
 
 
-        if (async_this_commit) {
-            commit_flags |=
-                DRM_MODE_PAGE_FLIP_ASYNC |
-                DRM_MODE_PAGE_FLIP_EVENT;
-        }
-
-
         int cr =
             drmModeAtomicCommit(
                 drmfd,
                 ar,
                 commit_flags,
-                async_this_commit
-                ? &flip
-                : NULL
+                NULL
             );
 
 
         const uint64_t
-            v3_commit_end_ns =
-            v3_mono_ns();
+            commit_end_ns =
+            mono_ns();
 
 
         int saved =
@@ -3578,15 +3277,6 @@ int main(
                 "drmModeAtomicCommit"
             );
 
-            if (async_this_commit) {
-                fprintf(
-                    stderr,
-                    "The kernel/driver rejected the pure async flip. "
-                    "This is a valid V3.5 unsupported result, not a "
-                    "V3.4 baseline failure.\n"
-                );
-            }
-
             run_failed = true;
             break;
         }
@@ -3597,15 +3287,14 @@ int main(
 
             fprintf(
                 stderr,
-                "V3.7 target timing applied: %u.%03u Hz\n",
+                "Target timing applied: %u.%03u Hz\n",
                 mode_refresh_millihz(&target_mode) / 1000U,
                 mode_refresh_millihz(&target_mode) % 1000U
             );
         }
 
 
-        if (!async_this_commit &&
-            out_fence < 0) {
+        if (out_fence < 0) {
 
             fprintf(
                 stderr,
@@ -3620,9 +3309,9 @@ int main(
 
 
         /*
-         * V3.8.1 safe early-window profiler.
+         * Safe readiness-window profiler.
          *
-         * V3.8 used OUT-fence readability as a proxy for the physical latch.
+         * An earlier experiment used OUT-fence readability as a proxy for the physical latch.
          * The hardware result proved that userspace can observe V4L2 readiness
          * after vblank but before the OUT sync-file becomes readable.  Dropping
          * that capture caused a two-vblank completion and one extra frame.
@@ -3632,10 +3321,9 @@ int main(
          * authoritative CRTC sequence.  The ordinary loop consumes the still-
          * queued V4L2 buffer after the current OUT fence completes.
          */
-        if (o.early_submit &&
+        if (o.window_profile &&
             frames >= 120 &&
             displayed >= 0 &&
-            !async_this_commit &&
             !modeset_this_commit) {
 
             struct pollfd pfds[2] = {
@@ -3649,7 +3337,7 @@ int main(
             } while (probe_poll < 0 && errno == EINTR);
 
             if (probe_poll < 0) {
-                perror("V3.8.1 readiness poll");
+                perror("readiness-window poll");
                 run_failed = true;
                 break;
             }
@@ -3667,75 +3355,52 @@ int main(
                         &observed_sequence,
                         &observed_ns) < 0) {
 
-                    perror("V3.8.1 drmCrtcGetSequence at readiness race");
+                    perror("drmCrtcGetSequence at readiness race");
                     run_failed = true;
                     break;
                 }
 
-                v381_capture_ready_before_out++;
+                window_capture_ready_before_out++;
 
-                if (observed_sequence == v36_commit_vblank_sequence) {
-                    v381_pre_latch_opportunities++;
+                if (observed_sequence == commit_vblank_sequence) {
+                    window_pre_latch_opportunities++;
                 }
                 else {
-                    v381_post_latch_fence_races++;
+                    window_post_latch_fence_races++;
                 }
             }
             else if (probe_poll > 0 && (pfds[0].revents & POLLIN)) {
-                v381_out_before_or_equal_ready++;
+                window_out_before_or_equal_ready++;
             }
         }
 
 
-        uint64_t v3_out_signal_ns;
+        uint64_t out_signal_ns;
 
 
-        if (async_this_commit) {
-            if (wait_flip_event(
-                drmfd,
-                &flip,
-                1000) < 0) {
+        if (wait_fd(
+            out_fence,
+            1000) < 0) {
 
-                perror("wait async page-flip event");
-                run_failed = true;
-                break;
-            }
-
-            v3_out_signal_ns =
-                flip.signal_ns;
-        }
-        else {
-            /*
-             * Normal V3.4 path: OUT_FENCE_PTR remains the display-side
-             * lifetime guard.  The async UAPI cannot accept this changing
-             * CRTC property, so V3.5 uses the page-flip completion event.
-             */
-            if (wait_fd(
-                out_fence,
-                1000) < 0) {
-
-                perror("wait KMS out-fence");
-                close(out_fence);
-                run_failed = true;
-                break;
-            }
-
-            v3_out_signal_ns =
-                v3_mono_ns();
-
+            perror("wait KMS out-fence");
             close(out_fence);
+            run_failed = true;
+            break;
         }
 
+        out_signal_ns = mono_ns();
+        close(out_fence);
 
-        uint64_t v36_out_vblank_sequence = 0;
-        uint64_t v36_out_vblank_ns = 0;
+
+        uint64_t out_vblank_sequence = 0;
+        uint64_t out_vblank_ns = 0;
 
         if (o.phase_profile &&
             drmCrtcGetSequence(
                 drmfd,
                 crtc_id,
-                &v36_out_vblank_sequence,
-                &v36_out_vblank_ns) < 0) {
+                &out_vblank_sequence,
+                &out_vblank_ns) < 0) {
 
             perror("drmCrtcGetSequence after completion");
             run_failed = true;
@@ -3760,7 +3425,7 @@ int main(
                 frames + 1;
 
             vs->sequence =
-                v3_sequence;
+                capture_sequence;
 
             vs->index =
                 b.index;
@@ -3768,38 +3433,29 @@ int main(
             vs->fence_present =
                 in_fence >= 0;
 
-            vs->async_commit =
-                async_this_commit;
-
-            vs->early_submit =
-                o.early_submit;
-
-            vs->overlap_commit =
-                false;
-
-            vs->intentional_drops_before =
-                0;
+            vs->window_profile =
+                o.window_profile;
 
             vs->v4l2_ts_ns =
-                v3_v4l2_ts_ns;
+                v4l2_ts_ns;
 
             vs->dq_ns =
-                v3_dq_ns;
+                dq_ns;
 
             vs->commit_begin_ns =
-                v3_commit_begin_ns;
+                commit_begin_ns;
 
             vs->commit_end_ns =
-                v3_commit_end_ns;
+                commit_end_ns;
 
             vs->out_signal_ns =
-                v3_out_signal_ns;
+                out_signal_ns;
 
             vs->qbuf_ns =
                 0;
 
             vs->v4l2_flags =
-                v36_v4l2_flags;
+                v4l2_flags;
 
             vs->phase_valid =
                 o.phase_profile;
@@ -3810,22 +3466,22 @@ int main(
                 : 0;
 
             vs->dq_vblank_sequence =
-                v36_dq_vblank_sequence;
+                dq_vblank_sequence;
 
             vs->dq_vblank_ns =
-                v36_dq_vblank_ns;
+                dq_vblank_ns;
 
             vs->commit_vblank_sequence =
-                v36_commit_vblank_sequence;
+                commit_vblank_sequence;
 
             vs->commit_vblank_ns =
-                v36_commit_vblank_ns;
+                commit_vblank_ns;
 
             vs->out_vblank_sequence =
-                v36_out_vblank_sequence;
+                out_vblank_sequence;
 
             vs->out_vblank_ns =
-                v36_out_vblank_ns;
+                out_vblank_ns;
         }
 
 
@@ -3853,9 +3509,9 @@ int main(
             }
 
 
-            v34_mark_qbuf(
+            mark_qbuf(
                 (uint32_t)displayed,
-                v3_mono_ns()
+                mono_ns()
             );
 
 
@@ -3895,10 +3551,10 @@ int main(
     /* Results                                                               */
     /* --------------------------------------------------------------------- */
 
-    v3_print_summary();
+    print_summary();
 
 
-    if (v3_write_csv(
+    if (write_csv(
         o.csv_path) < 0) {
 
         perror(
@@ -3927,12 +3583,11 @@ int main(
         "frames presented:           %" PRIu64 "\n"
         "missing Rockchip fences:     %" PRIu64 "\n"
         "userspace acquire waits:     %" PRIu64 " (%s)\n"
-        "phase profiler samples:      %zu (%s)\n"
-        "V3.8.1 capture ready before OUT: %" PRIu64 "\n"
-        "V3.8.1 OUT before/equal ready:   %" PRIu64 "\n"
-        "V3.8.1 genuine pre-latch ready:  %" PRIu64 "\n"
-        "V3.8.1 post-latch fence races:   %" PRIu64 "\n"
-        "V3.8.1 intentional drops:        0\n"
+        "timing samples:              %zu (phase profiling %s)\n"
+        "capture ready before OUT:    %" PRIu64 "\n"
+        "OUT before/equal ready:      %" PRIu64 "\n"
+        "genuine pre-latch ready:     %" PRIu64 "\n"
+        "post-latch fence races:      %" PRIu64 "\n"
         "last displayed capture buf: %d\n"
         "runtime status:              %s\n",
 
@@ -3949,10 +3604,10 @@ int main(
         ? "enabled"
         : "disabled",
 
-        v381_capture_ready_before_out,
-        v381_out_before_or_equal_ready,
-        v381_pre_latch_opportunities,
-        v381_post_latch_fence_races,
+        window_capture_ready_before_out,
+        window_out_before_or_equal_ready,
+        window_pre_latch_opportunities,
+        window_post_latch_fence_races,
 
         displayed,
 
@@ -3961,15 +3616,15 @@ int main(
         : "completed"
     );
 
-    if (o.early_submit) {
+    if (o.window_profile) {
         const char* outcome =
-            v381_pre_latch_opportunities
+            window_pre_latch_opportunities
             ? "genuine pre-latch readiness observed; no buffer disturbed"
-            : (v381_post_latch_fence_races
+            : (window_post_latch_fence_races
                 ? "OUT-fence notification lag confirmed; no buffer disturbed"
                 : "OUT fence was always ready first; no buffer disturbed");
 
-        fprintf(stderr, "V3.8.1 probe outcome:            %s\n", outcome);
+        fprintf(stderr, "readiness-window outcome:    %s\n", outcome);
     }
 
 
@@ -4052,7 +3707,7 @@ out:
             drmModeAtomicFree(restore);
 
         if (restore_ok) {
-            fprintf(stderr, "Restored original DRM mode after V3.7 run.\n");
+            fprintf(stderr, "Restored original DRM mode after target-mode run.\n");
         }
         else {
             perror("restore original DRM mode");
