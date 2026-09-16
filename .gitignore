@@ -1,46 +1,17 @@
+# Native build products
 /hdmirx-kms-lowlat
- \
-/hdmirx-kms-lowlat \
-*.o \
-*.csv \
-*.log \
-__pycache__/ \
-*.py[cod] > .gitignore
+*.o
 
+# Measurement output
+*.csv
+*.log
+report.txt
 
+# Python bytecode
+__pycache__/
+*.py[cod]
 
-
-
-
-
-printf *.on*.csv
- \
-/hdmirx-kms-lowlat \
-*.o \
-*.csv \
-*.log \
-__pycache__/ \
-*.py[cod] > .gitignore
-
-
-
-
-
-
-
-printf *.logn__pycache__/
- \
-/hdmirx-kms-lowlat \
-*.o \
-*.csv \
-*.log \
-__pycache__/ \
-*.py[cod] > .gitignore
-
-
-
-
-
-
-
-printf *.py[cod]n
+# Editor and operating-system files
+*~
+*.swp
+.DS_Store
