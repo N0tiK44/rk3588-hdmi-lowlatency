@@ -50,4 +50,14 @@ git push -u origin experiment/v3.5-async
 git push origin --tags
 ```
 
+For the current profiler release, upload/merge the complete V3.6 tree to `main`, verify it on the board, then tag the exact verified commit:
+
+```bash
+git tag -a v3.6-phase-profiler -m "Hardware-verified V3.6 phase profiler"
+git push origin v3.6-phase-profiler
+git switch -c experiment/v3.7-refresh-offset v3.6-phase-profiler
+```
+
+Do not create the V3.6 tag before the Orange Pi run passes; tags identify hardware-verified states, not merely uploaded code.
+
 Avoid using patch-application scripts, force-pushes, or untagged “known good” states as the rollback mechanism.

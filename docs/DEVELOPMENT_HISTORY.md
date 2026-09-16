@@ -12,13 +12,14 @@ This repository was reconstructed from the historical project packages and inten
 | V3.3 | Buffer/cadence sweep | Three buffers starve; four is the minimum stable pool. |
 | V3.3.1 | CSV-analysis repair | Added compatibility for malformed historical CSV newline formatting. |
 | V3.4 | Buffer-lifetime instrumentation | Added `qbuf_ns`; isolated display phase and ownership as the dominant delay. |
-| V3.5 | Async phase experiment | Capability-gated pure framebuffer async flip with page-flip completion events. Current stage. |
+| V3.5 | Async phase experiment | Linux 6.1 Rockchip/VOP2 rejected the atomic async commit; normal baseline remained valid. |
+| V3.6 | Phase profiler | Adds CRTC sequence/timestamp correlation and V4L2 timestamp diagnostics without changing the proven datapath. Current stage. |
 
 ## Consolidation decisions
 
 ### One C source, no patch chain
 
-The current `src/hdmirx-kms-lowlat.c` is based on the proven V2 direct path with the V3.1 measurement instrumentation, V3.4 QBUF lifetime timestamping and V3.5 async commit option integrated directly. Historical `apply-v3*.py` scripts are not required and are not shipped.
+The current `src/hdmirx-kms-lowlat.c` is based on the proven V2 direct path with the V3.1 measurement instrumentation, V3.4 QBUF lifetime timestamping, V3.5 async diagnostic and V3.6 phase profiler integrated directly. Historical `apply-v3*.py` scripts are not required and are not shipped.
 
 ### V3.5 historical patcher mismatch
 

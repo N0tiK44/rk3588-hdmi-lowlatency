@@ -26,7 +26,8 @@ The active path has **no GStreamer, no CPU colour conversion, no framebuffer cop
 - capture acquire fence: read from `v4l2_buffer.timecode.userbits`
 - baseline explicit sync: plane `IN_FENCE_FD` + CRTC `OUT_FENCE_PTR`
 - stable capture pool: **4 buffers minimum** at the characterized ~60 Hz mode
-- current experiment: **V3.5 `DRM_MODE_PAGE_FLIP_ASYNC` A/B test**
+- V3.5 result: **atomic async rejected as unsupported by the Rockchip 6.1 driver**
+- current experiment: **V3.6 non-invasive CRTC/vblank phase profiler**
 - long-term target: **1080p240**
 
 Connector/plane IDs are machine-specific. The defaults above are the proven test platform values.
@@ -96,6 +97,18 @@ The experiment queries `DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP`, which is distinct from 
 
 Results go to `/tmp/hdmirx-v35/`.
 
+## V3.6 phase profiler
+
+V3.6 keeps the proven normal atomic path. It adds timestamp-only diagnostics around capture dequeue, atomic commit and output-fence completion. No refresh offset, modeset, copy, conversion or extra queue is introduced in this version.
+
+```bash
+sudo bash ./scripts/run-v36-phase-profiler.sh
+```
+
+The default 120-second trace records the active mode period, V4L2 timestamp flags, and `drmCrtcGetSequence()` sequence/timestamp samples. The analyzer reports capture-to-display phase, predicted time to the next vblank, vblank advances, and phase drift. Results go to `/tmp/hdmirx-v36/`.
+
+Use the high-speed camera during the run. Keep both Windows outputs on the same duplicated image and record which connector/GPU drives each display. The direct MSI-to-Zowie control measured about 16 ms; the path through the Orange Pi measured about 33 ms, so the current working estimate is approximately one additional 16.7 ms display period inside the passthrough path.
+
 ## Analyze an existing trace
 
 ```bash
@@ -161,8 +174,11 @@ When an experiment is proven, merge it to `main` and create a new annotated tag 
 - `docs/ROADMAP.md` — V3.5 onward and 1080p240 target
 - `docs/DEVELOPMENT_HISTORY.md` — consolidated history and historical-package issues
 - `docs/VERSIONING.md` — rollback-safe tags and experiment branches
+- `docs/V36_RUNBOOK.md` — GitHub upload, Pi update, build and verification commands
 - `docs/results/v3.3-buffer-sweep.md` — buffer-count conclusion
 - `docs/results/v3.4-buffer-lifetime.md` — measured phase/ownership result
+- `docs/results/v3.5-async-result.md` — Linux 6.1 atomic-async rejection
+- `docs/results/v3.6-phase-profiler.md` — test procedure and interpretation
 
 ## License
 

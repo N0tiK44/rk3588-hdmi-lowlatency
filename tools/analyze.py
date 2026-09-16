@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze consolidated V3.4/V3.5 timing CSV traces.
-
-Usage:
-  tools/analyze.py TRACE.csv
-  tools/analyze.py NORMAL.csv ASYNC.csv
-"""
+"""Analyze RK3588 HDMI-RX/KMS V3.4-V3.6 timing CSV traces."""
 from __future__ import annotations
 
 import csv
@@ -16,6 +11,10 @@ from collections import defaultdict
 from pathlib import Path
 
 WARMUP_FRAMES = 60
+V4L2_TS_MASK = 0x0000E000
+V4L2_TS_MONOTONIC = 0x00002000
+V4L2_SRC_MASK = 0x00070000
+V4L2_SRC_SOE = 0x00010000
 
 
 def median(xs):
@@ -28,9 +27,7 @@ def percentile(xs, p):
     xs = sorted(xs)
     k = (len(xs) - 1) * p
     lo, hi = math.floor(k), math.ceil(k)
-    if lo == hi:
-        return xs[lo]
-    return xs[lo] * (hi - k) + xs[hi] * (k - lo)
+    return xs[lo] if lo == hi else xs[lo] * (hi - k) + xs[hi] * (k - lo)
 
 
 def integer(value):
@@ -46,9 +43,22 @@ def delta_us(a, b):
     return (b - a) / 1000.0
 
 
+def phase_us(event_ns, vblank_ns, period_ns):
+    if None in (event_ns, vblank_ns, period_ns) or period_ns <= 0:
+        return None
+    return ((event_ns - vblank_ns) % period_ns) / 1000.0
+
+
+def next_vblank_us(event_ns, vblank_ns, period_ns):
+    phase = phase_us(event_ns, vblank_ns, period_ns)
+    if phase is None:
+        return None
+    remaining = period_ns / 1000.0 - phase
+    return 0.0 if abs(remaining - period_ns / 1000.0) < 0.001 else remaining
+
+
 def load_csv(path):
     raw = Path(path).read_text(errors="replace")
-    # Compatibility with early V3 traces that accidentally wrote literal "\\n".
     if raw.count("\n") < 3 and raw.count("\\n") > 3:
         raw = raw.replace("\\n", "\n")
     reader = csv.DictReader(io.StringIO(raw))
@@ -59,87 +69,115 @@ def load_csv(path):
     missing = sorted(required - set(reader.fieldnames or []))
     if missing:
         raise RuntimeError(f"{path}: missing columns: {', '.join(missing)}")
-    if len(rows) > WARMUP_FRAMES + 10:
-        rows = rows[WARMUP_FRAMES:]
-    return rows
+    return rows[WARMUP_FRAMES:] if len(rows) > WARMUP_FRAMES + 10 else rows
 
 
 def analyze(path):
     rows = load_csv(path)
-    sync_rows = sum(integer(row.get("async_commit")) == 0 for row in rows)
-    async_rows = sum(integer(row.get("async_commit")) == 1 for row in rows)
-
-    # V3.5 starts with one normal commit to establish the plane, then issues
-    # pure async FB flips. Exclude that seed commit from an async trace.
+    sync_rows = sum(integer(r.get("async_commit")) == 0 for r in rows)
+    async_rows = sum(integer(r.get("async_commit")) == 1 for r in rows)
     if async_rows:
-        rows = [row for row in rows if integer(row.get("async_commit")) == 1]
+        rows = [r for r in rows if integer(r.get("async_commit")) == 1]
 
     metrics = defaultdict(list)
-    seq_gaps = 0
-    missing_fences = 0
+    seq_gaps = missing_fences = phase_rows = monotonic_rows = soe_rows = 0
     per_index_last_dq = {}
     per_index_reuse = defaultdict(list)
+    drift_points = []
+    last_phase_ns = None
+    unwrapped_phase_ns = 0
     prev = None
 
     for row in rows:
-        seq = integer(row.get("sequence"))
-        idx = integer(row.get("index"))
+        seq, idx = integer(row.get("sequence")), integer(row.get("index"))
         fence = integer(row.get("fence_present"))
-        dq = integer(row.get("dq_ns"))
-        cb = integer(row.get("commit_begin_ns"))
-        ce = integer(row.get("commit_end_ns"))
-        out = integer(row.get("out_signal_ns"))
-        qbuf = integer(row.get("qbuf_ns"))
-        vts = integer(row.get("v4l2_ts_ns"))
+        dq, cb = integer(row.get("dq_ns")), integer(row.get("commit_begin_ns"))
+        ce, out = integer(row.get("commit_end_ns")), integer(row.get("out_signal_ns"))
+        qbuf, vts = integer(row.get("qbuf_ns")), integer(row.get("v4l2_ts_ns"))
         if None in (seq, idx, dq, cb, ce, out):
             continue
-
-        if fence == 0:
-            missing_fences += 1
-
+        missing_fences += fence == 0
         for key, val in (
-            ("dq_to_commit_begin", delta_us(dq, cb)),
-            ("commit_ioctl", delta_us(cb, ce)),
-            ("commit_to_out", delta_us(ce, out)),
-            ("dq_to_out", delta_us(dq, out)),
+            ("dq_to_commit_begin", delta_us(dq, cb)), ("commit_ioctl", delta_us(cb, ce)),
+            ("commit_to_out", delta_us(ce, out)), ("dq_to_out", delta_us(dq, out)),
             ("own_out_to_qbuf", delta_us(out, qbuf)),
         ):
             if val is not None:
                 metrics[key].append(val)
-
         if prev is not None:
             if seq > prev["seq"] + 1:
                 seq_gaps += seq - prev["seq"] - 1
             for key, val in (
-                ("dq_period", delta_us(prev["dq"], dq)),
-                ("out_period", delta_us(prev["out"], out)),
+                ("dq_period", delta_us(prev["dq"], dq)), ("out_period", delta_us(prev["out"], out)),
                 ("prev_out_to_dq", delta_us(prev["out"], dq)),
                 ("prev_out_to_commit", delta_us(prev["out"], cb)),
                 ("v4l2_period", delta_us(prev["vts"], vts) if prev["vts"] and vts else None),
             ):
                 if val is not None:
                     metrics[key].append(val)
-
         if idx in per_index_last_dq:
             val = delta_us(per_index_last_dq[idx], dq)
             if val is not None:
                 per_index_reuse[idx].append(val)
                 metrics["same_buffer_reuse"].append(val)
         per_index_last_dq[idx] = dq
+
+        period = integer(row.get("mode_period_ns"))
+        flags = integer(row.get("v4l2_flags"))
+        phase_values = (
+            integer(row.get("dq_vblank_sequence")), integer(row.get("dq_vblank_ns")),
+            integer(row.get("commit_vblank_sequence")), integer(row.get("commit_vblank_ns")),
+            integer(row.get("out_vblank_sequence")), integer(row.get("out_vblank_ns")),
+        )
+        if integer(row.get("phase_valid")) == 1 and period and None not in phase_values:
+            phase_rows += 1
+            dq_seq, dq_vb, commit_seq, commit_vb, out_seq, out_vb = phase_values
+            if flags is not None and (flags & V4L2_TS_MASK) == V4L2_TS_MONOTONIC:
+                monotonic_rows += 1
+                val = delta_us(vts, dq)
+                if val is not None:
+                    metrics["v4l2_timestamp_to_dq"].append(val)
+            if flags is not None and (flags & V4L2_SRC_MASK) == V4L2_SRC_SOE:
+                soe_rows += 1
+            for key, val in (
+                ("dq_since_vblank", phase_us(dq, dq_vb, period)),
+                ("dq_to_next_vblank", next_vblank_us(dq, dq_vb, period)),
+                ("commit_since_vblank", phase_us(cb, commit_vb, period)),
+                ("commit_to_next_vblank", next_vblank_us(cb, commit_vb, period)),
+                ("out_since_vblank", phase_us(out, out_vb, period)),
+            ):
+                if val is not None:
+                    metrics[key].append(val)
+            metrics["dq_to_commit_vblank_advance"].append(commit_seq - dq_seq)
+            metrics["commit_to_out_vblank_advance"].append(out_seq - commit_seq)
+            current_phase_ns = (dq - dq_vb) % period
+            if last_phase_ns is not None:
+                step = current_phase_ns - last_phase_ns
+                if step > period / 2:
+                    step -= period
+                elif step < -period / 2:
+                    step += period
+                unwrapped_phase_ns += step
+            last_phase_ns = current_phase_ns
+            drift_points.append((dq, unwrapped_phase_ns))
         prev = {"seq": seq, "dq": dq, "out": out, "vts": vts}
 
     if not metrics["commit_to_out"]:
         raise RuntimeError(f"{path}: no usable timing rows")
-
+    drift_us = drift_ppm = math.nan
+    if len(drift_points) >= 2:
+        elapsed = drift_points[-1][0] - drift_points[0][0]
+        drift = drift_points[-1][1] - drift_points[0][1]
+        drift_us = drift / 1000.0
+        if elapsed > 0:
+            drift_ppm = drift / elapsed * 1_000_000.0
     return {
-        "path": str(path),
-        "rows": len(rows),
-        "sync_rows": sync_rows,
-        "async_rows": async_rows,
-        "sequence_gaps": seq_gaps,
-        "missing_fences": missing_fences,
-        "metrics": metrics,
-        "per_index_reuse": per_index_reuse,
+        "path": str(path), "rows": len(rows), "sync_rows": sync_rows,
+        "async_rows": async_rows, "seq_gaps": seq_gaps,
+        "missing_fences": missing_fences, "metrics": metrics,
+        "per_index_reuse": per_index_reuse, "phase_rows": phase_rows,
+        "monotonic_rows": monotonic_rows, "soe_rows": soe_rows,
+        "phase_drift_us": drift_us, "phase_drift_ppm": drift_ppm,
     }
 
 
@@ -147,39 +185,47 @@ def fmt_us(us):
     return "n/a" if math.isnan(us) else f"{us / 1000.0:.3f} ms"
 
 
-def metric_line(label, xs):
-    return (
-        f"  {label:<28} "
-        f"p50 {fmt_us(median(xs)):>10}   "
-        f"p95 {fmt_us(percentile(xs, 0.95)):>10}"
-    )
+def metric_line(label, xs, unit="time"):
+    p50, p95 = median(xs), percentile(xs, 0.95)
+    if unit == "count":
+        a = "n/a" if math.isnan(p50) else f"{p50:.1f}"
+        b = "n/a" if math.isnan(p95) else f"{p95:.1f}"
+    else:
+        a, b = fmt_us(p50), fmt_us(p95)
+    return f"  {label:<28} p50 {a:>10}   p95 {b:>10}"
 
 
 def show(label, result):
     m = result["metrics"]
     print(f"{label}: {result['path']} ({result['rows']} post-warmup rows)")
-    if result["sync_rows"] or result["async_rows"]:
-        print(
-            f"  commit modes: normal={result['sync_rows']} "
-            f"async={result['async_rows']}"
-        )
-    print(f"  sequence gaps: {result['sequence_gaps']}   missing acquire fences: {result['missing_fences']}")
-    print(metric_line("V4L2 timestamp cadence", m["v4l2_period"]))
-    print(metric_line("DQ -> next DQ", m["dq_period"]))
-    print(metric_line("OUT -> next OUT", m["out_period"]))
-    print(metric_line("previous OUT -> DQ", m["prev_out_to_dq"]))
-    print(metric_line("previous OUT -> commit", m["prev_out_to_commit"]))
-    print(metric_line("DQ -> commit call", m["dq_to_commit_begin"]))
-    print(metric_line("atomic commit ioctl", m["commit_ioctl"]))
-    print(metric_line("commit -> completion", m["commit_to_out"]))
-    print(metric_line("DQ -> completion", m["dq_to_out"]))
-    print(metric_line("own completion -> QBUF", m["own_out_to_qbuf"]))
-    print(metric_line("same-buffer DQ reuse", m["same_buffer_reuse"]))
+    print(f"  commit modes: normal={result['sync_rows']} async={result['async_rows']}")
+    print(f"  sequence gaps: {result['seq_gaps']}   missing acquire fences: {result['missing_fences']}")
+    for title, key in (
+        ("V4L2 timestamp cadence", "v4l2_period"), ("DQ -> next DQ", "dq_period"),
+        ("OUT -> next OUT", "out_period"), ("previous OUT -> DQ", "prev_out_to_dq"),
+        ("previous OUT -> commit", "prev_out_to_commit"), ("DQ -> commit call", "dq_to_commit_begin"),
+        ("atomic commit ioctl", "commit_ioctl"), ("commit -> completion", "commit_to_out"),
+        ("DQ -> completion", "dq_to_out"), ("own completion -> QBUF", "own_out_to_qbuf"),
+        ("same-buffer DQ reuse", "same_buffer_reuse"),
+    ):
+        print(metric_line(title, m[key]))
     if result["per_index_reuse"]:
-        parts = []
-        for idx in sorted(result["per_index_reuse"]):
-            parts.append(f"b{idx}={fmt_us(median(result['per_index_reuse'][idx]))}")
-        print("  per-index reuse p50:          " + ", ".join(parts))
+        values = ", ".join(f"b{i}={fmt_us(median(result['per_index_reuse'][i]))}" for i in sorted(result["per_index_reuse"]))
+        print("  per-index reuse p50:          " + values)
+    if result["phase_rows"]:
+        print("\n  V3.6 phase profiler:")
+        print(f"  valid rows: {result['phase_rows']}   monotonic timestamps: {result['monotonic_rows']}   SOE timestamps: {result['soe_rows']}")
+        for title, key in (
+            ("V4L2 timestamp -> DQ", "v4l2_timestamp_to_dq"),
+            ("DQ phase after vblank", "dq_since_vblank"), ("DQ -> predicted vblank", "dq_to_next_vblank"),
+            ("commit phase after vblank", "commit_since_vblank"),
+            ("commit -> predicted vblank", "commit_to_next_vblank"), ("OUT after vblank", "out_since_vblank"),
+        ):
+            print(metric_line(title, m[key]))
+        print(metric_line("DQ -> commit vblank steps", m["dq_to_commit_vblank_advance"], "count"))
+        print(metric_line("commit -> OUT vblank steps", m["commit_to_out_vblank_advance"], "count"))
+        if not math.isnan(result["phase_drift_us"]):
+            print(f"  unwrapped DQ/display drift:   {result['phase_drift_us'] / 1000.0:+.3f} ms ({result['phase_drift_ppm']:+.3f} ppm across trace)")
 
 
 def main(argv):
@@ -188,22 +234,12 @@ def main(argv):
     normal = analyze(argv[1])
     print("=== RK3588 HDMI-RX / KMS TIMING REPORT ===")
     show("NORMAL" if len(argv) == 3 else "TRACE", normal)
-
     if len(argv) == 3:
         async_result = analyze(argv[2])
         print()
         show("ASYNC", async_result)
-        n = median(normal["metrics"]["commit_to_out"])
-        a = median(async_result["metrics"]["commit_to_out"])
-        gain = n - a
-        print()
-        print(f"Async completion median improvement: {gain / 1000.0:.3f} ms")
-        if a < 0.5 * n:
-            print("Interpretation: major display-phase bypass detected.")
-        elif gain > 1000.0:
-            print("Interpretation: measurable async benefit, but not a full vblank bypass.")
-        else:
-            print("Interpretation: no meaningful phase bypass; proceed to phase/refresh-control work.")
+        gain = median(normal["metrics"]["commit_to_out"]) - median(async_result["metrics"]["commit_to_out"])
+        print(f"\nAsync completion median improvement: {gain / 1000.0:.3f} ms")
 
 
 if __name__ == "__main__":

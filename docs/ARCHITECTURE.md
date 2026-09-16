@@ -74,7 +74,7 @@ HDMI-RX may capture into it again
 
 This deliberately avoids requeueing a buffer that KMS may still be reading.
 
-## V3.4 instrumentation retained in V3.5
+## V3.4 instrumentation retained in V3.6
 
 Each sample records:
 
@@ -90,6 +90,12 @@ Each sample records:
 The CSV additionally includes precomputed microsecond deltas. `tools/analyze.py` derives inter-frame cadence, previous-OUT phase, own-OUT-to-QBUF, and same-buffer reuse.
 
 Early V3 measurement packages could emit literal `\\n` sequences into CSV output. The consolidated C writer emits normal physical newlines; the analyzer still repairs old traces for compatibility.
+
+## V3.6 phase instrumentation
+
+With `--phase-profile`, the normal atomic path also samples `drmCrtcGetSequence()` immediately after DQ, immediately before commit, and after output-fence completion. The raw CRTC sequence/timestamp values, active mode period, and V4L2 buffer timestamp flags are written to the CSV. DRM monotonic vblank timestamps are required so all events share the `CLOCK_MONOTONIC` domain.
+
+These extra ioctls are diagnostic overhead and V3.6 does not claim they reduce latency. The analyzer uses them to estimate each event's phase after the most recent vblank, time until the predicted next vblank, vblank sequence advances, and unwrapped capture/display phase drift.
 
 ## V3.5 async experiment
 

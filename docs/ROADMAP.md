@@ -1,6 +1,6 @@
 # Roadmap
 
-## V3.5 — current: async page-flip A/B test
+## V3.5 — completed: async page-flip A/B test
 
 Goal: determine whether RK3588 DRM/VOP2 accepts `DRM_MODE_PAGE_FLIP_ASYNC` on this atomic plane path and whether it materially reduces the approximately one-refresh `commit → OUT` delay.
 
@@ -15,15 +15,21 @@ Success criteria:
 
 If async is rejected by the driver, record that as the V3.5 result and move on; do not hide the failure behind a copy/conversion path.
 
-## V3.6 — phase / refresh control
+Hardware result: Linux 6.1.115-vendor-rk35xx did not advertise atomic async page flips and rejected the diagnostic atomic async commit with `EINVAL`. The normal trace remained healthy. This is an unsupported-feature result, not a regression.
 
-If async does not bypass the display phase:
+## V3.6 — current: phase profiler
+
+V3.6 measures before changing timing:
 
 - measure exact input vs output phase over long traces,
 - capture real CRTC timing and refresh precisely,
-- test small output refresh offsets around source cadence,
+- correlate DQ, commit and OUT with CRTC vblank sequence/timestamps,
+- record V4L2 timestamp clock/source flags,
+- quantify phase drift over a 120-second run,
 - determine the phase window needed to land an update before the next latch point,
 - distinguish unavoidable scanout time from avoidable one-period waits.
+
+Refresh-offset experiments belong in V3.7 only after V3.6 establishes the direction and rate of drift.
 
 ## High-refresh validation
 

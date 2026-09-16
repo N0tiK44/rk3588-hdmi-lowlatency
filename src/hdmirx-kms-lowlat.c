@@ -37,15 +37,16 @@
 #endif
 
 #define MAX_BUFS 8
-#define MAX_SAMPLES 16384
+#define MAX_SAMPLES 65536
 
 /*
- * CONSOLIDATED V3.5 MEASUREMENT BUILD
+ * CONSOLIDATED V3.6 PHASE-PROFILER BUILD
  *
  * Working V2 zero-copy path
  * + V3 measurement instrumentation
  * + V3.4 buffer-lifetime instrumentation
  * + V3.5 async page-flip A/B experiment
+ * + V3.6 CRTC/vblank phase instrumentation
  *
  * Current proven architecture:
  *
@@ -80,6 +81,16 @@ struct frame_sample {
     uint64_t commit_end_ns;
     uint64_t out_signal_ns;
     uint64_t qbuf_ns;
+
+    uint32_t v4l2_flags;
+    int phase_valid;
+    uint64_t mode_period_ns;
+    uint64_t dq_vblank_sequence;
+    uint64_t dq_vblank_ns;
+    uint64_t commit_vblank_sequence;
+    uint64_t commit_vblank_ns;
+    uint64_t out_vblank_sequence;
+    uint64_t out_vblank_ns;
 };
 
 static struct frame_sample g_samples[MAX_SAMPLES];
@@ -124,6 +135,39 @@ static uint64_t v3_timeval_ns(const struct timeval* tv)
 {
     return (uint64_t)tv->tv_sec * 1000000000ULL +
         (uint64_t)tv->tv_usec * 1000ULL;
+}
+
+
+static uint64_t v36_mode_period_ns(const drmModeModeInfo* mode)
+{
+    if (!mode ||
+        !mode->clock ||
+        !mode->htotal ||
+        !mode->vtotal) {
+
+        return 0;
+    }
+
+    uint64_t numerator_hz =
+        (uint64_t)mode->clock * 1000ULL;
+
+    uint64_t denominator =
+        (uint64_t)mode->htotal *
+        (uint64_t)mode->vtotal;
+
+    if (mode->flags & DRM_MODE_FLAG_INTERLACE)
+        numerator_hz *= 2ULL;
+
+    if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
+        denominator *= 2ULL;
+
+    if (mode->vscan > 1)
+        denominator *= mode->vscan;
+
+    return (
+        denominator * 1000000000ULL +
+        numerator_hz / 2ULL
+    ) / numerator_hz;
 }
 
 
@@ -370,6 +414,15 @@ static int v3_write_csv(const char* path)
         "commit_end_ns,"
         "out_signal_ns,"
         "qbuf_ns,"
+        "v4l2_flags,"
+        "phase_valid,"
+        "mode_period_ns,"
+        "dq_vblank_sequence,"
+        "dq_vblank_ns,"
+        "commit_vblank_sequence,"
+        "commit_vblank_ns,"
+        "out_vblank_sequence,"
+        "out_vblank_ns,"
         "dq_to_commit_us,"
         "commit_ioctl_us,"
         "commit_to_out_us,"
@@ -425,6 +478,15 @@ static int v3_write_csv(const char* path)
             "%" PRIu64 ","
             "%" PRIu64 ","
             "%" PRIu64 ","
+            "%u,"
+            "%d,"
+            "%" PRIu64 ","
+            "%" PRIu64 ","
+            "%" PRIu64 ","
+            "%" PRIu64 ","
+            "%" PRIu64 ","
+            "%" PRIu64 ","
+            "%" PRIu64 ","
             "%" PRIu64 ","
             "%" PRIu64 ","
             "%" PRIu64 ","
@@ -441,6 +503,15 @@ static int v3_write_csv(const char* path)
             x->commit_end_ns,
             x->out_signal_ns,
             x->qbuf_ns,
+            x->v4l2_flags,
+            x->phase_valid,
+            x->mode_period_ns,
+            x->dq_vblank_sequence,
+            x->dq_vblank_ns,
+            x->commit_vblank_sequence,
+            x->commit_vblank_ns,
+            x->out_vblank_sequence,
+            x->out_vblank_ns,
             a,
             b,
             c,
@@ -470,6 +541,7 @@ struct opts {
     bool enable_low_latency;
     bool verbose;
     bool async_flip;
+    bool phase_profile;
 
     const char* csv_path;
 };
@@ -1340,6 +1412,7 @@ static void usage(
         "  --buffers N              V4L2 buffers 3..8 (default 4)\n"
         "  --no-low-latency         do not toggle rockchip_hdmirx low_latency\n"
         "  --async-flip             request DRM_MODE_PAGE_FLIP_ASYNC (experimental)\n"
+        "  --phase-profile          record V3.6 CRTC/vblank phase data\n"
         "  --csv PATH               timing CSV (default /tmp/hdmirx-lowlat.csv)\n"
         "  -v, --verbose            extra per-frame output\n",
 
@@ -1383,6 +1456,9 @@ int main(
             false,
 
         .async_flip =
+            false,
+
+        .phase_profile =
             false,
 
         .csv_path =
@@ -1454,6 +1530,13 @@ int main(
                 no_argument,
                 0,
                 9
+            },
+
+            {
+                "phase-profile",
+                no_argument,
+                0,
+                10
             },
 
             {
@@ -1556,6 +1639,11 @@ int main(
                 true;
             break;
 
+        case 10:
+            o.phase_profile =
+                true;
+            break;
+
         case 'v':
             o.verbose =
                 true;
@@ -1575,9 +1663,19 @@ int main(
     if (optind != argc ||
         o.num_buffers < 3 ||
         o.num_buffers > MAX_BUFS ||
-        o.seconds < 1) {
+        o.seconds < 1 ||
+        (o.async_flip && o.phase_profile)) {
 
         usage(argv[0]);
+
+        if (o.async_flip && o.phase_profile) {
+            fprintf(
+                stderr,
+                "--phase-profile intentionally measures only the normal "
+                "OUT_FENCE_PTR path; do not combine it with --async-flip.\n"
+            );
+        }
+
         return 2;
     }
 
@@ -1887,6 +1985,35 @@ int main(
     }
 
 
+    if (o.phase_profile) {
+        uint64_t timestamp_monotonic = 0;
+
+        if (drmGetCap(
+            drmfd,
+            DRM_CAP_TIMESTAMP_MONOTONIC,
+            &timestamp_monotonic) < 0) {
+
+            perror("DRM_CAP_TIMESTAMP_MONOTONIC");
+            goto out;
+        }
+
+        if (!timestamp_monotonic) {
+            fprintf(
+                stderr,
+                "V3.6 requires monotonic DRM vblank timestamps so they "
+                "share a clock domain with DQ/commit measurements.\n"
+            );
+
+            goto out;
+        }
+
+        fprintf(
+            stderr,
+            "DRM monotonic vblank timestamps: yes\n"
+        );
+    }
+
+
     if (o.async_flip) {
         uint64_t atomic_async_cap = 0;
         uint64_t legacy_async_cap = 0;
@@ -2059,6 +2186,34 @@ int main(
         crtc->width,
         crtc->height
     );
+
+
+    uint64_t phase_mode_period_ns =
+        v36_mode_period_ns(&crtc->mode);
+
+    if (o.phase_profile) {
+        if (!phase_mode_period_ns) {
+            fprintf(
+                stderr,
+                "Could not calculate the active CRTC period.\n"
+            );
+
+            goto out;
+        }
+
+        fprintf(
+            stderr,
+            "V3.6 active mode: %s clock=%u kHz htotal=%u "
+            "vtotal=%u vscan=%u period=%.6f ms refresh=%.6f Hz\n",
+            crtc->mode.name,
+            crtc->mode.clock,
+            crtc->mode.htotal,
+            crtc->mode.vtotal,
+            crtc->mode.vscan,
+            (double)phase_mode_period_ns / 1e6,
+            1e9 / (double)phase_mode_period_ns
+        );
+    }
 
 
     if (crtc->width != w ||
@@ -2565,15 +2720,20 @@ int main(
         "No userspace framebuffer copy.\n"
         "V4L2 NV24 DMABUF -> DRM FB "
         "-> atomic KMS plane.\n"
-        "Consolidated V3.5 build: "
-        "V3.4 lifetime instrumentation enabled.\n"
+        "Consolidated V3.6 build: "
+        "V3.4 lifetime and V3.6 phase instrumentation available.\n"
         "Atomic commit mode: %s\n"
+        "Phase profiler: %s\n"
         "Timing CSV: %s\n"
         "Auto-stop: %d seconds.\n\n",
 
         o.async_flip
         ? "ASYNC (experimental)"
         : "normal/vblank",
+
+        o.phase_profile
+        ? "enabled"
+        : "disabled",
 
         o.csv_path,
         o.seconds
@@ -2604,7 +2764,7 @@ int main(
      * Previous consolidated source returned success whenever
      * frames > 0, even if a fatal DRM/V4L2 error occurred later.
      *
-     * V3.5 A/B testing depends on trustworthy exit codes.
+     * V3.5/V3.6 measurements depend on trustworthy exit codes.
      */
     bool run_failed = false;
 
@@ -2741,6 +2901,53 @@ int main(
         const uint32_t
             v3_sequence =
             b.sequence;
+
+
+        const uint32_t
+            v36_v4l2_flags =
+            b.flags;
+
+
+        if (o.phase_profile && frames == 0) {
+            const uint32_t timestamp_type =
+                b.flags & V4L2_BUF_FLAG_TIMESTAMP_MASK;
+
+            const uint32_t timestamp_source =
+                b.flags & V4L2_BUF_FLAG_TSTAMP_SRC_MASK;
+
+            fprintf(
+                stderr,
+                "V3.6 V4L2 timestamp flags: raw=0x%08x "
+                "clock=%s source=%s\n",
+                b.flags,
+                timestamp_type == V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC
+                ? "MONOTONIC"
+                : "UNKNOWN/NON-MONOTONIC",
+                timestamp_source == V4L2_BUF_FLAG_TSTAMP_SRC_EOF
+                ? "EOF"
+                : (
+                    timestamp_source == V4L2_BUF_FLAG_TSTAMP_SRC_SOE
+                    ? "SOE"
+                    : "OTHER"
+                )
+            );
+        }
+
+
+        uint64_t v36_dq_vblank_sequence = 0;
+        uint64_t v36_dq_vblank_ns = 0;
+
+        if (o.phase_profile &&
+            drmCrtcGetSequence(
+                drmfd,
+                crtc_id,
+                &v36_dq_vblank_sequence,
+                &v36_dq_vblank_ns) < 0) {
+
+            perror("drmCrtcGetSequence at DQ");
+            run_failed = true;
+            break;
+        }
 
 
         /*
@@ -2906,6 +3113,27 @@ int main(
         }
 
 
+        uint64_t v36_commit_vblank_sequence = 0;
+        uint64_t v36_commit_vblank_ns = 0;
+
+        if (o.phase_profile &&
+            drmCrtcGetSequence(
+                drmfd,
+                crtc_id,
+                &v36_commit_vblank_sequence,
+                &v36_commit_vblank_ns) < 0) {
+
+            perror("drmCrtcGetSequence before commit");
+            drmModeAtomicFree(ar);
+
+            if (in_fence >= 0)
+                close(in_fence);
+
+            run_failed = true;
+            break;
+        }
+
+
         const uint64_t
             v3_commit_begin_ns =
             v3_mono_ns();
@@ -3032,6 +3260,22 @@ int main(
         }
 
 
+        uint64_t v36_out_vblank_sequence = 0;
+        uint64_t v36_out_vblank_ns = 0;
+
+        if (o.phase_profile &&
+            drmCrtcGetSequence(
+                drmfd,
+                crtc_id,
+                &v36_out_vblank_sequence,
+                &v36_out_vblank_ns) < 0) {
+
+            perror("drmCrtcGetSequence after completion");
+            run_failed = true;
+            break;
+        }
+
+
         /* ------------------------------------------------------------- */
         /* Record measurement sample                                     */
         /* ------------------------------------------------------------- */
@@ -3077,6 +3321,35 @@ int main(
 
             vs->qbuf_ns =
                 0;
+
+            vs->v4l2_flags =
+                v36_v4l2_flags;
+
+            vs->phase_valid =
+                o.phase_profile;
+
+            vs->mode_period_ns =
+                o.phase_profile
+                ? phase_mode_period_ns
+                : 0;
+
+            vs->dq_vblank_sequence =
+                v36_dq_vblank_sequence;
+
+            vs->dq_vblank_ns =
+                v36_dq_vblank_ns;
+
+            vs->commit_vblank_sequence =
+                v36_commit_vblank_sequence;
+
+            vs->commit_vblank_ns =
+                v36_commit_vblank_ns;
+
+            vs->out_vblank_sequence =
+                v36_out_vblank_sequence;
+
+            vs->out_vblank_ns =
+                v36_out_vblank_ns;
         }
 
 
@@ -3178,6 +3451,7 @@ int main(
         "frames presented:           %" PRIu64 "\n"
         "missing Rockchip fences:     %" PRIu64 "\n"
         "userspace acquire waits:     %" PRIu64 " (%s)\n"
+        "phase profiler samples:      %zu (%s)\n"
         "last displayed capture buf: %d\n"
         "runtime status:              %s\n",
 
@@ -3188,6 +3462,11 @@ int main(
         pp.in_fence_fd
         ? "KMS accepted IN_FENCE_FD instead"
         : "plane had no IN_FENCE_FD",
+
+        g_sample_count,
+        o.phase_profile
+        ? "enabled"
+        : "disabled",
 
         displayed,
 
